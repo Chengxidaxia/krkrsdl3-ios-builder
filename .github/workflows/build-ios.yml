@@ -54,6 +54,8 @@ jobs:
           p = "src/cpp/environ/sdl3/sdl3_app.cpp"
           MARK = "[patched] iOS game dir"
           SIG = "SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])"
+          INC_ANCHOR = "#include <SDL3/SDL_main.h>"
+          INC_ADD = "#include <SDL3/SDL_filesystem.h>"   # SDL_GetBasePath 在这里
           INJECT = (
               "#if defined(_KRKRSDL3_IOS)\n"
               "    /* patched: iOS has no cmdline; use <bundle>/game as argv[1] */\n"
@@ -78,6 +80,9 @@ jobs:
           if MARK in src:
               print("already patched")
           else:
+              assert INC_ANCHOR in src, "SDL_main.h include not found"
+              if INC_ADD not in src:
+                  src = src.replace(INC_ANCHOR, INC_ANCHOR + "\n" + INC_ADD, 1)
               i = src.find(SIG)
               assert i >= 0, "SDL_AppInit signature not found"
               j = src.find("{", i)
@@ -86,8 +91,10 @@ jobs:
                   src[:j + 1] + "\n" + INJECT + src[j + 1:])
               print("patched:", p)
           PYEOF
-          echo "--- verify ---"
-          grep -n -A 5 "SDL_AppResult SDL_AppInit" src/cpp/environ/sdl3/sdl3_app.cpp | head -12
+          echo "--- verify: includes ---"
+          sed -n '1,12p' src/cpp/environ/sdl3/sdl3_app.cpp
+          echo "--- verify: injected block ---"
+          grep -n -A 4 "SDL_AppResult SDL_AppInit" src/cpp/environ/sdl3/sdl3_app.cpp | head -10
 
       - name: Setup vcpkg
         env:
@@ -126,7 +133,7 @@ jobs:
 
       - name: Verify app bundle completeness
         run: |
-          APP=$(find src/out -type d -name "krkrsdl3.app" | head -1)
+          APP=$(find src/out -type d -name "krkrsdl3.app" -not -path "*/build/*" | head -1)
           echo "APP=$APP"
           find src/out -maxdepth 4 | head -60
           if [ -z "$APP" ]; then
@@ -147,7 +154,7 @@ jobs:
       - name: Package unsigned IPA
         run: |
           set -e
-          APP=$(find src/out -type d -name "krkrsdl3.app" | head -1)
+          APP=$(find src/out -type d -name "krkrsdl3.app" -not -path "*/build/*" | head -1)
           if [ -z "$APP" ]; then
             echo "::error::krkrsdl3.app not found"
             find src/out -type d | head -60
