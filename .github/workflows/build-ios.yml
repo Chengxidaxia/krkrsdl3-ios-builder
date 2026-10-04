@@ -183,8 +183,36 @@ jobs:
           fi
           echo "APP=$APP"
           ls -la "$APP"
-          echo "--- Info.plist ---"
+          echo "--- Info.plist (before) ---"
           /usr/libexec/PlistBuddy -c Print "$APP/Info.plist" 2>/dev/null | head -30 || true
+          # 补齐 iOS 必需、但 CMake 没写进最终 plist 的键。
+          # krkrsdl3_build 只把 bundle id 设成 Xcode target 的构建设置，最终 plist 里
+          # 连 CFBundleIdentifier 都没有 -> Sideloadly 报 "Install failed: 'CFBundleIdentifier'"。
+          python3 - "$APP/Info.plist" <<'PYEOF'
+          import plistlib, sys
+          p = sys.argv[1]
+          with open(p, "rb") as f:
+              pl = plistlib.load(f)
+          added = []
+          for k, v in [
+              ("CFBundleIdentifier", "org.tvp.krkrsdl3"),
+              ("CFBundleName", "krkrsdl3"),
+              ("CFBundleVersion", "1"),
+              ("CFBundleShortVersionString", "0.0.6"),
+              ("UISupportedInterfaceOrientations",
+               ["UIInterfaceOrientationPortrait",
+                "UIInterfaceOrientationLandscapeLeft",
+                "UIInterfaceOrientationLandscapeRight"]),
+          ]:
+              if not pl.get(k):
+                  pl[k] = v
+                  added.append(k)
+          with open(p, "wb") as f:
+              plistlib.dump(pl, f, fmt=plistlib.FMT_BINARY)
+          print("plist fixed:", ", ".join(added) if added else "(already complete)")
+          PYEOF
+          echo "--- Info.plist (after) ---"
+          /usr/libexec/PlistBuddy -c Print "$APP/Info.plist" 2>/dev/null | grep -E "CFBundleIdentifier|CFBundleName|CFBundleVersion|UISupportedInterfaceOrientations" || true
           rm -rf Payload krkrsdl3-device.ipa
           mkdir -p Payload
           cp -R "$APP" Payload/
