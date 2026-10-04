@@ -1,13 +1,19 @@
 name: Build krkrsdl3 iOS IPA
 
-# 云构建：在 GitHub 的 macOS runner 上把 krkrsdl3 编译成 iOS 设备版 .app，
-# 再打成未签名的 .ipa 供下载。仓库本身只存这个工作流，引擎源码在运行时从上游拉取，
-# 因此不需要往仓库上传任何大文件，也不会包含任何游戏数据。
+# 在 GitHub 的 macOS runner 上把 krkrsdl3 编译成 iOS 设备版 .app 并打成未签名 ipa。
+# 仓库只存这个工作流；引擎源码运行时从上游 clone，因此不含任何游戏数据。
+#
+# 关键改动（"打开就玩"）：environ/sdl3/sdl3_app.cpp 的 SDL_AppInit 要求 argc>=2、
+# argv[1]=游戏目录，而 iOS 由 UIApplicationMain 启动、没有命令行，原版必然启动失败。
+# 这里在编译前给它打一个补丁：iOS 下用 SDL_GetBasePath() 拼出 <bundle>/game 当 argv[1]。
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+
+permissions:
+  contents: write
 
 jobs:
   build-ios:
@@ -24,7 +30,6 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos --show-sdk-path
           cmake --version | head -1
-          ninja --version || true
           git --version
           df -h / | tail -1
 
@@ -40,8 +45,49 @@ jobs:
           ls src
           echo "--- submodule cpp ---"
           ls src/cpp | head -20
-          echo "--- presets present ---"
-          ls -la src/CMakePresets.json src/vcpkg.json src/CMakeLists.txt
+          ls -la src/CMakePresets.json src/vcpkg.json src/cpp/environ/sdl3/sdl3_app.cpp
+
+      - name: Patch iOS entry (read game from app bundle)
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          p = "src/cpp/environ/sdl3/sdl3_app.cpp"
+          MARK = "[patched] iOS game dir"
+          SIG = "SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])"
+          INJECT = (
+              "#if defined(_KRKRSDL3_IOS)\n"
+              "    /* patched: iOS has no cmdline; use <bundle>/game as argv[1] */\n"
+              "    {\n"
+              "        static char s_exe[] = \"krkrsdl3\";\n"
+              "        static char s_game[4096];\n"
+              "        static char* s_argv[2];\n"
+              "        if (s_game[0] == 0)\n"
+              "        {\n"
+              "            const char* base = SDL_GetBasePath();\n"
+              "            if (!base || !base[0]) base = \"./\";\n"
+              "            SDL_snprintf(s_game, sizeof(s_game), \"%sgame\", base);\n"
+              "        }\n"
+              "        s_argv[0] = s_exe;\n"
+              "        s_argv[1] = s_game;\n"
+              "        argc = 2; argv = s_argv;\n"
+              "        SDL_Log(\"[patched] iOS game dir: %s\", s_game);\n"
+              "    }\n"
+              "#endif\n"
+          )
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched")
+          else:
+              i = src.find(SIG)
+              assert i >= 0, "SDL_AppInit signature not found"
+              j = src.find("{", i)
+              assert j >= 0, "opening brace not found"
+              io.open(p, "w", encoding="utf-8", newline="").write(
+                  src[:j + 1] + "\n" + INJECT + src[j + 1:])
+              print("patched:", p)
+          PYEOF
+          echo "--- verify ---"
+          grep -n -A 5 "SDL_AppResult SDL_AppInit" src/cpp/environ/sdl3/sdl3_app.cpp | head -12
 
       - name: Setup vcpkg
         env:
@@ -82,11 +128,8 @@ jobs:
           find src/out -maxdepth 3 | head -60
           echo "--- app bundles ---"
           find src/out -type d -name "*.app" | head
-          echo "--- sizes ---"
-          du -sh src/out/* 2>/dev/null | head
 
       - name: Package unsigned IPA
-        id: pkg
         run: |
           set -e
           APP=$(find src/out -type d -name "krkrsdl3.app" | head -1)
@@ -98,13 +141,14 @@ jobs:
           echo "APP=$APP"
           ls -la "$APP"
           echo "--- Info.plist ---"
-          /usr/libexec/PlistBuddy -c Print "$APP/Info.plist" 2>/dev/null | head -40 || true
+          /usr/libexec/PlistBuddy -c Print "$APP/Info.plist" 2>/dev/null | head -30 || true
           rm -rf Payload krkrsdl3-device.ipa
           mkdir -p Payload
           cp -R "$APP" Payload/
+          # 预留 game/ 目录：本地注入数据时直接放进去
+          mkdir -p "Payload/krkrsdl3.app/game"
           zip -qry krkrsdl3-device.ipa Payload
           ls -la krkrsdl3-device.ipa
-          echo "ipa_built=1" >> "$GITHUB_OUTPUT"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
@@ -113,6 +157,15 @@ jobs:
           path: krkrsdl3-device.ipa
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish to Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ios-build-${{ github.run_number }}" krkrsdl3-device.ipa \
+            --title "krkrsdl3 iOS build #${{ github.run_number }}" \
+            --notes "Unsigned iOS device ipa (patched to load game from bundle/game)." || true
 
       - name: Upload build logs on failure
         if: failure()
