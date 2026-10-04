@@ -267,6 +267,12 @@ jobs:
               '            TVPAddImportantLog(TJS_N("[dbg] trace: ") + e.GetTrace());',
               "            throw;",
               "        }",
+              "        catch (const TJS::eTJS& e)",
+              "        {",
+              "            /* patched: eTJSScriptError (base) also escapes -- log it too. */",
+              '            TVPAddImportantLog(TJS_N("[dbg] startup script error: ") + e.GetMessage());',
+              "            throw;",
+              "        }",
           ])
           src = io.open(p, encoding="utf-8", newline="").read()
           if MARK in src:
@@ -317,6 +323,38 @@ jobs:
           PYEOF
           echo "--- verify ---"
           grep -n -A 3 "storage miss: " src/cpp/core/archive/TVPStorage.cpp | head -6
+
+      - name: Patch iOS tjs2 exception-message logging
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          # tjs2 的 dump（==== An exception occured ====）不含异常消息；
+          # 在 AddTrace 之后、rethrow 之前把消息打进 console（会进 krkr-ios.log），
+          # 这样连被游戏 try/catch 吃掉的异常也能看到消息。
+          p = "src/cpp/tjs2/tjsInterCodeExec.cpp"
+          A = (
+              "        e.AddTrace(this, (tjs_int)(codesave - CodeArea));\n"
+              "        throw e;"
+          )
+          MARK = "[dbg] script exception: "
+          D = (
+              "        e.AddTrace(this, (tjs_int)(codesave - CodeArea));\n"
+              "        /* patched: the exception message otherwise never reaches the\n"
+              "           log (the VM dump only shows code + registers). */\n"
+              "        Block->GetTJS()->OutputToConsole(\n"
+              "            (TJS_N(\"[dbg] script exception: \") + e.GetMessage()).c_str());\n"
+              "        throw e;"
+          )
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched:", p)
+          else:
+              assert src.count(A) == 2, "AddTrace+throw pair count = %d (expect 2)" % src.count(A)
+              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D))
+              print("patched:", p, "(2 sites)")
+          PYEOF
+          echo "--- verify ---"
+          grep -n -B 1 "script exception: " src/cpp/tjs2/tjsInterCodeExec.cpp | head -6
 
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
