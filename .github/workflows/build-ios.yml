@@ -356,6 +356,44 @@ jobs:
           echo "--- verify ---"
           grep -n -B 1 "script exception: " src/cpp/tjs2/tjsInterCodeExec.cpp | head -6
 
+      - name: Patch iOS about-string capability probe
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          # game scripts (sysscn/movieqsel.tjs) probe System.getAboutString()
+          # for "kirikiriz" / "(info) IDirect3D9" to decide whether to create
+          # the movie-quality menu (movieQualitySelectMenuItem). krkrsdl3 iOS
+          # reports neither -> menu never built -> custom.tjs(211) throws.
+          # Report Z-compatible capabilities so the menu gets created.
+          # NOTE: injected C++ deliberately contains no backslashes.
+          p = "src/cpp/core/msg/TVPMsg.cpp"
+          A = (
+              "    return TVPFormatMessage(TVPReadAboutStringFromResource().c_str(), verstr, tjsverstr) +\n"
+              "           TVPGetImportantLog();\n"
+              "}"
+          )
+          MARK = "kirikiriz compatible engine"
+          L1 = "    ttstr krkrAbout = TVPFormatMessage(TVPReadAboutStringFromResource().c_str(), verstr, tjsverstr) +"
+          L2 = "           TVPGetImportantLog();"
+          L3 = "#ifdef _KRKRSDL3_IOS"
+          L4 = "    /* patched: game capability probe (kirikiriz / IDirect3D9) */"
+          L5 = '    krkrAbout += TJS_N("! (info) IDirect3D9 or higher detected. Retrieving current Direct3D driver information...");'
+          L6 = '    krkrAbout += TJS_N("! (info) kirikiriz compatible engine");'
+          L7 = "#endif"
+          L8 = "    return krkrAbout;"
+          L9 = "}"
+          D = "\n".join([L1, L2, L3, L4, L5, L6, L7, L8, L9])
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched:", p)
+          else:
+              assert src.count(A) == 1, "AboutString return not unique (%d)" % src.count(A)
+              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D, 1))
+              print("patched:", p)
+          PYEOF
+          echo "--- verify ---"
+          grep -n -A 2 "kirikiriz compatible" src/cpp/core/msg/TVPMsg.cpp | head -4
+
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
