@@ -122,28 +122,45 @@ jobs:
           python3 - <<'PYEOF'
           import io
           p = "src/cpp/core/utils/TVPSettings.cpp"
-          MARK = "iOS: bundle is read-only"
-          OLD = '    TVPDataPath = TVPProjectDir + TJS_N("savedata/");'
-          NEW = (
-              "#if defined(_KRKRSDL3_IOS)\n"
-              "    /* iOS: bundle is read-only, so savedata + logs must go to the\n"
-              "       writable sandbox (Documents). Game data still loads from\n"
-              "       <bundle>/game via argv[1]. */\n"
-              "    TVPDataPath = ttstr(TVPGetDefaultFileDir().c_str()) + TJS_N(\"/savedata/\");\n"
-              "#else\n"
-              "    TVPDataPath = TVPProjectDir + TJS_N(\"savedata/\");\n"
-              "#endif"
-          )
+          MARK = "iOS: the .app bundle is read-only"
+          # 原始源码里的两行（必须一起换掉）
+          L1 = '    TVPDataPath = TVPProjectDir + TJS_N("savedata/");'
+          L2 = '    TVPNativeDataPath = TVPGetLocallyAccessibleName(TVPDataPath);'
+          # C 源码刻意不含反斜杠与单引号，便于在 Python 单引号串里零转义书写
+          NEW = "\n".join([
+              '#if defined(_KRKRSDL3_IOS)',
+              '    /* iOS: the .app bundle is read-only, so savedata and the engine log',
+              '       must live in the writable sandbox (Documents).',
+              '       TVPDataPath has to be a storage name (file://...) because the',
+              '       next line feeds it to TVPGetLocallyAccessibleName(), which',
+              '       looks the media up by name -- a raw native path contains no',
+              '       colon, so the media lookup fails and throws',
+              '       TVPUnsupportedMediaName (TJS::eTJSError -> uncaught -> abort).',
+              '       So build the storage name explicitly and set the native path',
+              '       directly instead of round-tripping through the media layer. */',
+              '    ttstr krkrSandboxDir =',
+              '        ttstr(TVPGetDefaultFileDir().c_str()) + TJS_N("/savedata/");',
+              '    TVPDataPath = ttstr(TJS_N("file://.")) + krkrSandboxDir;',
+              '    TVPNativeDataPath = krkrSandboxDir;',
+              '#else',
+              L1,
+              L2,
+              '#endif',
+          ])
           src = io.open(p, encoding="utf-8", newline="").read()
           if MARK in src:
               print("already patched")
           else:
-              assert OLD in src, "savedata assignment not found in TVPSettings.cpp"
-              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(OLD, NEW, 1))
+              assert src.count(L1) == 1, "expected exactly 1 TVPDataPath assignment"
+              assert src.count(L2) == 1, "expected exactly 1 TVPNativeDataPath assignment"
+              i = src.index(L1)
+              j = src.index(L2, i)
+              out = src[:i] + NEW + src[j + len(L2):]
+              io.open(p, "w", encoding="utf-8", newline="").write(out)
               print("patched:", p)
           PYEOF
           echo "--- verify ---"
-          grep -n -A 3 "iOS: bundle is read-only" src/cpp/core/utils/TVPSettings.cpp | head -8
+          grep -n -A 14 "iOS: the .app bundle is read-only" src/cpp/core/utils/TVPSettings.cpp | head -20
 
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
@@ -229,6 +246,19 @@ jobs:
               '        fputs("[hook] infoDictionary:", stderr);',
               '        fputc(10, stderr);',
               '        krkrPuts([[[[NSBundle mainBundle] infoDictionary] description] UTF8String]);',
+              '        fputs("[hook] bundle/game:", stderr);',
+              '        fputc(10, stderr);',
+              '        {',
+              '            NSString* gd = [[[NSBundle mainBundle] bundlePath]',
+              '                stringByAppendingPathComponent:@"game"];',
+              '            NSArray* items = [[NSFileManager defaultManager]',
+              '                contentsOfDirectoryAtPath:gd error:nil];',
+              '            for (NSString* it in items)',
+              '            {',
+              '                fputs("    ", stderr);',
+              '                krkrPuts([it UTF8String]);',
+              '            }',
+              '        }',
               '        fflush(stderr);',
               '    }',
               '}',
