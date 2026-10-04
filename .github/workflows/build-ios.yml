@@ -279,6 +279,45 @@ jobs:
           echo "--- verify ---"
           grep -n -A 4 "startup script exception: " src/cpp/core/main/TVPApplication.cpp | head -8
 
+      - name: Patch iOS storage-miss logging
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          # 游戏的安装自检（Storages.tjs(88)「解像度別データがありません」）走的是
+          # Storages.isExistentStorage，失败时不留任何痕迹。把 miss 的名字打进日志，
+          # 就能知道它到底在找哪个文件。
+          p = "src/cpp/core/archive/TVPStorage.cpp"
+          A = (
+              "bool TVPIsExistentStorage(const ttstr& name)\n"
+              "{\n"
+              "    return !TVPGetPlacedPath(name).IsEmpty();\n"
+              "}"
+          )
+          MARK = "[dbg] storage miss: "
+          D = "\n".join([
+              "bool TVPIsExistentStorage(const ttstr& name)",
+              "{",
+              "    ttstr krkrPlaced = TVPGetPlacedPath(name);",
+              "    if (krkrPlaced.IsEmpty())",
+              "    {",
+              "        /* patched: log which storage the game checks and misses --",
+              "           existence checks fail silently otherwise. */",
+              '        TVPAddLog(TJS_N("[dbg] storage miss: ") + name);',
+              "    }",
+              "    return !krkrPlaced.IsEmpty();",
+              "}",
+          ])
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched:", p)
+          else:
+              assert src.count(A) == 1, "TVPIsExistentStorage body not unique"
+              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D, 1))
+              print("patched:", p)
+          PYEOF
+          echo "--- verify ---"
+          grep -n -A 3 "storage miss: " src/cpp/core/archive/TVPStorage.cpp | head -6
+
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
