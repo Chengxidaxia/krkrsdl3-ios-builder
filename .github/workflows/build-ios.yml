@@ -244,6 +244,41 @@ jobs:
           echo "--- verify 3: TVPAddImportantLog 在本文件可见 ---"
           grep -c "TVPAddImportantLog" src/cpp/core/archive/TVPStorage.cpp
 
+      - name: Patch iOS startup-exception logging
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          # StartApplication() 只 catch EAbort，游戏脚本的 TJS 异常会带着消息
+          # 直接逃逸 -> abort，什么都看不见。这里在逃逸前把消息和 trace 打进日志。
+          p = "src/cpp/core/main/TVPApplication.cpp"
+          A = "        TVPInitializeStartupScript();"
+          MARK = "[dbg] startup script exception:"
+          D = "\n".join([
+              "        try",
+              "        {",
+              "            TVPInitializeStartupScript();",
+              "        }",
+              "        catch (const TJS::eTJSScriptException& e)",
+              "        {",
+              "            /* patched: log the game script exception (message + trace)",
+              "               before it escapes -- without this the process aborts and",
+              "               nothing is visible in the log. */",
+              '            TVPAddImportantLog(TJS_N("[dbg] startup script exception: ") + e.GetMessage());',
+              '            TVPAddImportantLog(TJS_N("[dbg] trace: ") + e.GetTrace());',
+              "            throw;",
+              "        }",
+          ])
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched:", p)
+          else:
+              assert src.count(A) == 1, "TVPInitializeStartupScript() call not unique"
+              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D, 1))
+              print("patched:", p)
+          PYEOF
+          echo "--- verify ---"
+          grep -n -A 4 "startup script exception: " src/cpp/core/main/TVPApplication.cpp | head -8
+
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
