@@ -261,17 +261,17 @@ jobs:
               "        catch (const TJS::eTJSScriptException& e)",
               "        {",
               "            /* patched: log the game script exception (message + trace)",
-              "               before it escapes -- without this the process aborts and",
-              "               nothing is visible in the log. */",
+              "               log it and CONTINUE -- krkr2/Kirikiroid2 show an ignorable\n"
+              "               dialog here instead of aborting; game-specific init\n"
+              "               errors (e.g. missing movie-quality menu item on iOS)\n"
+              "               are non-fatal. */",
               '            TVPAddImportantLog(TJS_N("[dbg] startup script exception: ") + e.GetMessage());',
               '            TVPAddImportantLog(TJS_N("[dbg] trace: ") + e.GetTrace());',
-              "            throw;",
               "        }",
               "        catch (const TJS::eTJS& e)",
               "        {",
-              "            /* patched: eTJSScriptError (base) also escapes -- log it too. */",
+              "            /* patched: log and continue (see above). */",
               '            TVPAddImportantLog(TJS_N("[dbg] startup script error: ") + e.GetMessage());',
-              "            throw;",
               "        }",
           ])
           src = io.open(p, encoding="utf-8", newline="").read()
