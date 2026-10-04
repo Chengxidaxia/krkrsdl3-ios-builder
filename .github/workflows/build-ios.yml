@@ -115,19 +115,34 @@ jobs:
       - name: Configure (iOS Device)
         working-directory: src
         run: |
-          cmake --preset "iOS Device Config" -DUSE_RENDER_VK=OFF 2>&1 | tail -80
+          set -o pipefail   # 关键：防止 | tail 把 cmake 的失败退出码吃掉
+          cmake --preset "iOS Device Config" -DUSE_RENDER_VK=OFF 2>&1 | tee /tmp/configure.log | tail -80
 
       - name: Build (iOS Device Release)
         working-directory: src
         run: |
-          cmake --build --preset "iOS Device Release Build" --parallel 2>&1 | tail -120
+          set -o pipefail   # 关键：同上
+          cmake --build --preset "iOS Device Release Build" --parallel 2>&1 | tee /tmp/build.log | tail -150
 
-      - name: Inspect build output
+      - name: Verify app bundle completeness
         run: |
-          echo "--- output tree (depth 3) ---"
-          find src/out -maxdepth 3 | head -60
-          echo "--- app bundles ---"
-          find src/out -type d -name "*.app" | head
+          APP=$(find src/out -type d -name "krkrsdl3.app" | head -1)
+          echo "APP=$APP"
+          find src/out -maxdepth 4 | head -60
+          if [ -z "$APP" ]; then
+            echo "::error::krkrsdl3.app not produced"
+            exit 1
+          fi
+          echo "--- bundle tree ---"
+          ls -la "$APP"
+          if [ ! -f "$APP/krkrsdl3" ]; then
+            echo "::error::executable 'krkrsdl3' missing inside app bundle -> build did not link"
+            echo "--- configure log tail ---"; tail -60 /tmp/configure.log || true
+            echo "--- build log tail ---"; tail -180 /tmp/build.log || true
+            exit 1
+          fi
+          echo "executable size: $(stat -f%z "$APP/krkrsdl3") bytes"
+          echo "--- verified: bundle has executable ---"
 
       - name: Package unsigned IPA
         run: |
@@ -173,7 +188,17 @@ jobs:
         with:
           name: build-logs
           path: |
+            /tmp/configure.log
+            /tmp/build.log
             src/out/**/*.log
             src/vcpkg-manifest-install.log
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Dump logs into the job output on failure
+        if: failure()
+        run: |
+          echo "========== CONFIGURE LOG (tail 200) =========="
+          tail -200 /tmp/configure.log 2>/dev/null || echo "(no configure log)"
+          echo "========== BUILD LOG (tail 400) =========="
+          tail -400 /tmp/build.log 2>/dev/null || echo "(no build log)"
