@@ -1,0 +1,126 @@
+name: Build krkrsdl3 iOS IPA
+
+# 云构建：在 GitHub 的 macOS runner 上把 krkrsdl3 编译成 iOS 设备版 .app，
+# 再打成未签名的 .ipa 供下载。仓库本身只存这个工作流，引擎源码在运行时从上游拉取，
+# 因此不需要往仓库上传任何大文件，也不会包含任何游戏数据。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-ios:
+    name: iOS device build -> ipa
+    runs-on: macos-14
+    timeout-minutes: 355
+
+    steps:
+      - name: Toolchain info
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+          cmake --version | head -1
+          ninja --version || true
+          git --version
+          df -h / | tail -1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch krkrsdl3_build source
+        run: |
+          set -e
+          git clone --recursive --shallow-submodules --depth 1 \
+            https://github.com/krkrsdl3/krkrsdl3_build.git src
+          echo "--- src top ---"
+          ls src
+          echo "--- submodule cpp ---"
+          ls src/cpp | head -20
+          echo "--- presets present ---"
+          ls -la src/CMakePresets.json src/vcpkg.json src/CMakeLists.txt
+
+      - name: Setup vcpkg
+        env:
+          VCPKG_DISABLE_METRICS: 1
+        run: |
+          set -e
+          VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
+          "$VCPKG_DIR/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VCPKG_DIR" >> "$GITHUB_ENV"
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$RUNNER_TEMP/vcpkg-bincache" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/vcpkg-bincache"
+          "$VCPKG_DIR/vcpkg" version
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/vcpkg-bincache
+            ${{ runner.temp }}/vcpkg/downloads
+          key: vcpkg-ios-${{ hashFiles('src/vcpkg.json') }}
+          restore-keys: |
+            vcpkg-ios-
+
+      - name: Configure (iOS Device)
+        working-directory: src
+        run: |
+          cmake --preset "iOS Device Config" -DUSE_RENDER_VK=OFF 2>&1 | tail -80
+
+      - name: Build (iOS Device Release)
+        working-directory: src
+        run: |
+          cmake --build --preset "iOS Device Release Build" --parallel 2>&1 | tail -120
+
+      - name: Inspect build output
+        run: |
+          echo "--- output tree (depth 3) ---"
+          find src/out -maxdepth 3 | head -60
+          echo "--- app bundles ---"
+          find src/out -type d -name "*.app" | head
+          echo "--- sizes ---"
+          du -sh src/out/* 2>/dev/null | head
+
+      - name: Package unsigned IPA
+        id: pkg
+        run: |
+          set -e
+          APP=$(find src/out -type d -name "krkrsdl3.app" | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::krkrsdl3.app not found"
+            find src/out -type d | head -60
+            exit 1
+          fi
+          echo "APP=$APP"
+          ls -la "$APP"
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c Print "$APP/Info.plist" 2>/dev/null | head -40 || true
+          rm -rf Payload krkrsdl3-device.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry krkrsdl3-device.ipa Payload
+          ls -la krkrsdl3-device.ipa
+          echo "ipa_built=1" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: krkrsdl3-ios-ipa
+          path: krkrsdl3-device.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            src/out/**/*.log
+            src/vcpkg-manifest-install.log
+          if-no-files-found: ignore
+          retention-days: 7
