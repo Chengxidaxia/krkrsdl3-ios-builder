@@ -96,6 +96,27 @@ jobs:
           echo "--- verify: injected block ---"
           grep -n -A 4 "SDL_AppResult SDL_AppInit" src/cpp/environ/sdl3/sdl3_app.cpp | head -10
 
+      - name: Patch 7zCrc (disable ARM HW CRC for Apple clang)
+        run: |
+          python3 - <<'PYEOF'
+          import io, re
+          p = "src/cpp/plugins/Kirikiroid2/7zip/7zCrc.c"
+          MARK = "ARM HW CRC disabled"
+          PAT = re.compile(r"#define Z7_CRC_HW_USE(\r?\n)[ \t]*#include <arm_acle\.h>")
+          REPL = ('/* patched: Apple clang lacks __target__("crc"); ARM HW CRC disabled */\\1'
+                  '        /* #include <arm_acle.h> */')
+          src = io.open(p, encoding="utf-8", errors="surrogateescape", newline="").read()
+          if MARK in src:
+              print("already patched")
+          else:
+              out, n = PAT.subn(REPL, src)
+              assert n == 1, "expected exactly 1 match, got %d" % n
+              io.open(p, "w", encoding="utf-8", errors="surrogateescape", newline="").write(out)
+              print("patched:", p)
+          PYEOF
+          echo "--- verify: ARM HW CRC disabled, falls back to table CRC ---"
+          grep -n -A 1 "ARM HW CRC disabled" src/cpp/plugins/Kirikiroid2/7zip/7zCrc.c | head -6
+
       - name: Setup vcpkg
         env:
           VCPKG_DISABLE_METRICS: 1
