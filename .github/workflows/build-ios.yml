@@ -52,30 +52,53 @@ jobs:
           python3 - <<'PYEOF'
           import io
           p = "src/cpp/environ/sdl3/sdl3_app.cpp"
-          MARK = "[patched] iOS game dir"
+          MARK = "[patched] iOS data :"
           SIG = "SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])"
           INC_ANCHOR = "#include <SDL3/SDL_main.h>"
           INC_ADD = "#include <SDL3/SDL_filesystem.h>"   # SDL_GetBasePath 在这里
-          INJECT = (
-              "#if defined(_KRKRSDL3_IOS)\n"
-              "    /* patched: iOS has no cmdline; use <bundle>/game as argv[1] */\n"
-              "    {\n"
-              "        static char s_exe[] = \"krkrsdl3\";\n"
-              "        static char s_game[4096];\n"
-              "        static char* s_argv[2];\n"
-              "        if (s_game[0] == 0)\n"
-              "        {\n"
-              "            const char* base = SDL_GetBasePath();\n"
-              "            if (!base || !base[0]) base = \"./\";\n"
-              "            SDL_snprintf(s_game, sizeof(s_game), \"%sgame\", base);\n"
-              "        }\n"
-              "        s_argv[0] = s_exe;\n"
-              "        s_argv[1] = s_game;\n"
-              "        argc = 2; argv = s_argv;\n"
-              "        SDL_Log(\"[patched] iOS game dir: %s\", s_game);\n"
-              "    }\n"
-              "#endif\n"
-          )
+          # 说明（源码实测结论）：
+          #   TVPStorage.h 注释写明 TVPProjectData 应是 "file://*/Game/data.xp3>"
+          #   或 "*/Game/data/"。传目录（无尾斜杠）会坏：
+          #   TVPCheckExistentLocalFile() 用 S_ISREG，目录返回 false，于是不会追加
+          #   归档分隔符 '>'，随后 TVPSetCurrentDirectory() 因末位不是分隔符而抛
+          #   TVPMissingPathDelimiterAtLast。所以这里传 data.xp3（文件）——这也是
+          #   桌面版/网页版跑通时的形态（网页那轮日志就是 file://./data.xp3 + 1138 个文件）。
+          #   argv[0] 给可执行文件的绝对路径，让 TVPNativeExeDir 落在 bundle 根。
+          # C 源码刻意不含反斜杠与单引号，便于在 Python 单引号串里零转义书写。
+          INJECT = "\n".join([
+              '#if defined(_KRKRSDL3_IOS)',
+              '    /* patched: iOS has no command line, so synthesize argv.',
+              '       argv[0] = absolute path of the app executable',
+              '                 (so TVPNativeExeDir is the bundle root).',
+              '       argv[1] = <bundle>/game/data.xp3 -- the project data has to be',
+              '       the XP3 file, not the folder: TVPBeforeSystemInit() appends the',
+              '       archive delimiter only when the path is a regular file, and',
+              '       TVPSetCurrentDirectory() throws TVPMissingPathDelimiterAtLast',
+              '       when the name has no trailing delimiter. With the xp3 the current',
+              '       directory becomes <...>/game/data.xp3> and startup.tjs is found',
+              '       inside the archive -- same as the desktop and web builds. */',
+              '    {',
+              '        static char s_exe[4096];',
+              '        static char s_dat[4096];',
+              '        static char* s_argv[2];',
+              '        static int s_ready = 0;',
+              '        if (!s_ready)',
+              '        {',
+              '            const char* base = SDL_GetBasePath();',
+              '            if (!base || !base[0]) base = "./";',
+              '            SDL_snprintf(s_exe, sizeof(s_exe), "%skrkrsdl3", base);',
+              '            SDL_snprintf(s_dat, sizeof(s_dat), "%sgame/data.xp3", base);',
+              '            s_argv[0] = s_exe;',
+              '            s_argv[1] = s_dat;',
+              '            s_ready = 1;',
+              '            SDL_Log("[patched] iOS exe  : %s", s_exe);',
+              '            SDL_Log("[patched] iOS data : %s", s_dat);',
+              '        }',
+              '        argc = 2; argv = s_argv;',
+              '    }',
+              '#endif',
+              '',
+          ])
           src = io.open(p, encoding="utf-8", newline="").read()
           if MARK in src:
               print("already patched")
@@ -161,6 +184,65 @@ jobs:
           PYEOF
           echo "--- verify ---"
           grep -n -A 14 "iOS: the .app bundle is read-only" src/cpp/core/utils/TVPSettings.cpp | head -20
+
+      - name: Patch iOS project data delimiter + auto-path diagnostics
+        run: |
+          python3 - <<'PYEOF'
+          import io
+
+          # --- 1) TVPBeforeSystemInit(): 目录形式缺尾部分隔符会抛异常（防御性补齐）---
+          p1 = "src/cpp/core/main/TVPSystem.cpp"
+          A1 = "    TVPSetCurrentDirectory(TVPProjectData);"
+          MARK1 = "[patched] project data ->"
+          D1 = "\n".join([
+              "    else if (TVPProjectData.GetLastChar() != TJS_N('/'))",
+              "    {",
+              "        /* patched: TVPSetCurrentDirectory() below requires a trailing delimiter",
+              "           (TVPInitializeBaseSystems() adds one via IncludeTrailingBackslash()).",
+              "           A project dir passed as a plain folder path has none, because the",
+              "           archive delimiter is only appended for a regular file. */",
+              '        TVPProjectData += TJS_N("/");',
+              "    }",
+              '    TVPAddImportantLog(TJS_N("[patched] project data -> ") + TVPProjectData);',
+              A1,
+          ])
+          s1 = io.open(p1, encoding="utf-8", newline="").read()
+          if MARK1 in s1:
+              print("already patched:", p1)
+          else:
+              assert s1.count(A1) == 1, "TVPSetCurrentDirectory(TVPProjectData) not unique"
+              io.open(p1, "w", encoding="utf-8", newline="").write(s1.replace(A1, D1, 1))
+              print("patched:", p1)
+
+          # --- 2) TVPRebuildAutoPathTable(): 把自动路径表的真实内容打出来 ---
+          p2 = "src/cpp/core/archive/TVPStorage.cpp"
+          A2 = "    TVPAddLog((const tjs_char*)TVPInfoRebuildingAutoPath);"
+          MARK2 = "[dbg] auto paths   ="
+          D2 = "\n".join([
+              A2,
+              '    TVPAddImportantLog(TJS_N("[dbg] project data = ") + TVPProjectData);',
+              '    TVPAddImportantLog(TJS_N("[dbg] project dir  = ") + TVPProjectDir);',
+              '    TVPAddImportantLog(TJS_N("[dbg] auto paths   = ") + ttstr((tjs_int)TVPAutoPathList.size()));',
+              "    {",
+              "        std::vector<ttstr>::iterator dbgit;",
+              "        for (dbgit = TVPAutoPathList.begin(); dbgit != TVPAutoPathList.end(); ++dbgit)",
+              '            TVPAddImportantLog(TJS_N("[dbg]   entry: ") + *dbgit);',
+              "    }",
+          ])
+          s2 = io.open(p2, encoding="utf-8", newline="").read()
+          if MARK2 in s2:
+              print("already patched:", p2)
+          else:
+              assert s2.count(A2) == 1, "TVPInfoRebuildingAutoPath log not unique"
+              io.open(p2, "w", encoding="utf-8", newline="").write(s2.replace(A2, D2, 1))
+              print("patched:", p2)
+          PYEOF
+          echo "--- verify 1: project data ---"
+          grep -n -B 2 -A 3 "project data ->" src/cpp/core/main/TVPSystem.cpp | head -14
+          echo "--- verify 2: auto path dump ---"
+          grep -n -A 3 "auto paths   =" src/cpp/core/archive/TVPStorage.cpp | head -8
+          echo "--- verify 3: TVPAddImportantLog 在本文件可见 ---"
+          grep -c "TVPAddImportantLog" src/cpp/core/archive/TVPStorage.cpp
 
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
