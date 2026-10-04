@@ -394,6 +394,62 @@ jobs:
           echo "--- verify ---"
           grep -n -A 2 "kirikiriz compatible" src/cpp/core/msg/TVPMsg.cpp | head -4
 
+      - name: Patch iOS missing menu-item fallback (tjs2 property get)
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          # main/custom.tjs reads a config menu item that the game only creates
+          # when movie files are present (absent in this data subset). Return an
+          # inert placeholder instead of throwing, so init can finish.
+          p = "src/cpp/tjs2/tjsInterCodeExec.cpp"
+          MARK = "substituted missing member"
+          INC_A = '#include "tjsNative.h"'
+          INC_B = INC_A + chr(10) + '#include "tjsArray.h"'
+          A = (
+              "    hr = clo.PropGet(flags, name->GetString(), name->GetHint(), TJS_GET_VM_REG_ADDR(ra, code[1])," + chr(10) +
+              "                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());" + chr(10) +
+              "    if (TJS_FAILED(hr))" + chr(10) +
+              "        TJSThrowFrom_tjs_error(hr, TJS_GET_VM_REG(DataArea, code[3]).GetString());"
+          )
+          D = chr(10).join([
+              "    hr = clo.PropGet(flags, name->GetString(), name->GetHint(), TJS_GET_VM_REG_ADDR(ra, code[1]),",
+              "                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());",
+              "    if (TJS_FAILED(hr))",
+              "    {",
+              "        /* patched: inert placeholder for the config menu item the game",
+              "           skips building on this engine (no movie files present). */",
+              "        if (hr == TJS_E_MEMBERNOTFOUND && name->Type() == tvtString &&",
+              "            TJS_strcmp(name->GetString(), TJS_N(\"movieQualitySelectMenuItem\")) == 0)",
+              "        {",
+              "            iTJSDispatch2* krkrChildren = TJSCreateArrayObject();",
+              "            iTJSDispatch2* krkrItem = TJSCreateArrayObject();",
+              "            tTJSVariant krkrCV(krkrChildren, krkrChildren);",
+              "            krkrItem->PropSet(TJS_MEMBERENSURE, TJS_N(\"children\"), NULL, &krkrCV, krkrItem);",
+              "            krkrCV.Release();",
+              "            krkrChildren->Release();",
+              "            tTJSVariant krkrIV(krkrItem, krkrItem);",
+              "            krkrItem->Release();",
+              "            *TJS_GET_VM_REG_ADDR(ra, code[1]) = krkrIV;",
+              "            Block->GetTJS()->OutputToConsole(TJS_N(\"[dbg] substituted missing member: movieQualitySelectMenuItem\"));",
+              "            return;",
+              "        }",
+              "        TJSThrowFrom_tjs_error(hr, TJS_GET_VM_REG(DataArea, code[3]).GetString());",
+              "    }",
+          ])
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched:", p)
+          else:
+              assert src.count(A) == 1, "GetPropertyDirect tail not unique (%d)" % src.count(A)
+              src = src.replace(A, D, 1)
+              assert src.count(INC_A) == 1, "include anchor not unique (%d)" % src.count(INC_A)
+              src = src.replace(INC_A, INC_B, 1)
+              io.open(p, "w", encoding="utf-8", newline="").write(src)
+              print("patched:", p)
+          PYEOF
+          echo "--- verify ---"
+          grep -n -A 2 "substituted missing member" src/cpp/tjs2/tjsInterCodeExec.cpp | head -5
+
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
