@@ -117,6 +117,34 @@ jobs:
           echo "--- verify: ARM HW CRC disabled, falls back to table CRC ---"
           grep -n -A 1 "ARM HW CRC disabled" src/cpp/plugins/Kirikiroid2/7zip/7zCrc.c | head -6
 
+      - name: Patch iOS savedata path (bundle is read-only)
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          p = "src/cpp/core/utils/TVPSettings.cpp"
+          MARK = "iOS: bundle is read-only"
+          OLD = '    TVPDataPath = TVPProjectDir + TJS_N("savedata/");'
+          NEW = (
+              "#if defined(_KRKRSDL3_IOS)\n"
+              "    /* iOS: bundle is read-only, so savedata + logs must go to the\n"
+              "       writable sandbox (Documents). Game data still loads from\n"
+              "       <bundle>/game via argv[1]. */\n"
+              "    TVPDataPath = ttstr(TVPGetDefaultFileDir().c_str()) + TJS_N(\"/savedata/\");\n"
+              "#else\n"
+              "    TVPDataPath = TVPProjectDir + TJS_N(\"savedata/\");\n"
+              "#endif"
+          )
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched")
+          else:
+              assert OLD in src, "savedata assignment not found in TVPSettings.cpp"
+              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(OLD, NEW, 1))
+              print("patched:", p)
+          PYEOF
+          echo "--- verify ---"
+          grep -n -A 3 "iOS: bundle is read-only" src/cpp/core/utils/TVPSettings.cpp | head -8
+
       - name: Setup vcpkg
         env:
           VCPKG_DISABLE_METRICS: 1
