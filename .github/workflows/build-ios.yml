@@ -559,7 +559,16 @@ jobs:
                             'extern "C" void KrkrGetRealScreenSize(int* outW, int* outH);', "real-screen-decl")
               s1 = sub1(s1, 'static SDL_Window* tvp_window;',
                             'SDL_Window* tvp_window;   /* patched: was static; exported so that the\n'
-                            '                             screen-size queries can report the real window */',
+                            '                             screen-size queries can report the real window */\n'
+                            '\n'
+                            '/* patched (r29): the real screen size, in pixels, as reported by UIKit.\n'
+                            '   0 means "not known yet" -- callers must fall back to SDL.  This exists\n'
+                            '   because SDL on iOS reports 480x320 for every size query (the window is\n'
+                            '   fullscreen and its size is owned by the UIKit view), and its\n'
+                            '   SDL_SetWindowSize is silently ignored.  See ci/inject_and_pack.py for\n'
+                            '   the underlying Info.plist root cause (missing UILaunchScreen). */\n'
+                            'int krkrIOSRealW = 0;\n'
+                            'int krkrIOSRealH = 0;',
                         "export-window")
               # ---- ★ r26：SDL_AppInit 幂等化（iOS 上 SDL 会重入一次）----
               # r25 日志证据：19.97s 出现第二轮 "Exe path / Game path / Specified option"，
@@ -657,11 +666,21 @@ jobs:
                   '            return SDL_APP_FAILURE;\n'
                   '    }\n'
                   '    }   /* end r26 re-entry guard */\n'
-                  '    /* r27/r28: force the window to the REAL screen size.\n'
-                  '       r27 showed `iOS display=480x320 window=480x320 pixels=480x320`: on iOS\n'
-                  '       SDL reports 480x320 for every one of those queries, so comparing the\n'
-                  '       window against the display was always true-equal and the fixup never\n'
-                  '       ran. Ask UIKit instead (KrkrGetRealScreenSize, ios_core.mm). */\n'
+                  '    /* r27/r28/r29: report the REAL screen size, and make the render\n'
+                  '       pipeline use it.\n'
+                  '       r27: `iOS display=480x320 window=480x320 pixels=480x320` -- every SDL\n'
+                  '       query on iOS echoes 480x320, so comparing the window against the\n'
+                  '       display was always equal and the fixup never ran.\n'
+                  '       r28: UIKit gave 640x960 (portrait) and SDL_SetWindowSize did NOTHING:\n'
+                  '       the log read `window corrected -> 480x320`, i.e. the call was accepted\n'
+                  '       but ignored.  On iOS this window is created with SDL_WINDOW_FULLSCREEN\n'
+                  '       and its size belongs to the UIKit view, so SDL_SetWindowSize is a\n'
+                  '       no-op there.  Calling it again just adds a misleading log line.\n'
+                  '       r29: the actual fix lives in Info.plist (UILaunchScreen -- see\n'
+                  '       ci/inject_and_pack.py).  Without it iOS runs the app in legacy\n'
+                  '       compatibility scaling with a pinned 640x960 logical screen.  All we\n'
+                  '       do here is publish the real size so the frame loop and the compositor\n'
+                  '       stop using SDL\'s bogus 480x320. */\n'
                   '    {\n'
                   '        int krkrRealW = 0, krkrRealH = 0;\n'
                   '        KrkrGetRealScreenSize(&krkrRealW, &krkrRealH);\n'
@@ -671,23 +690,19 @@ jobs:
                   '        SDL_GetWindowSizeInPixels(tvp_window, &krkrPW, &krkrPH);\n'
                   '        SDL_Log("[patched] iOS real=%dx%d window=%dx%d pixels=%dx%d",\n'
                   '                krkrRealW, krkrRealH, krkrCurW, krkrCurH, krkrPW, krkrPH);\n'
-                  '        if (krkrRealW > 0 && krkrRealH > 0\n'
-                  '            && (krkrCurW != krkrRealW || krkrCurH != krkrRealH))\n'
+                  '        if (krkrRealW > 0 && krkrRealH > 0)\n'
                   '        {\n'
-                  '            SDL_SetWindowSize(tvp_window, krkrRealW, krkrRealH);\n'
-                  '            SDL_SetWindowPosition(tvp_window,\n'
-                  '                                  SDL_WINDOWPOS_CENTERED,\n'
-                  '                                  SDL_WINDOWPOS_CENTERED);\n'
-                  '            int krkrNW = 0, krkrNH = 0;\n'
-                  '            SDL_GetWindowSize(tvp_window, &krkrNW, &krkrNH);\n'
-                  '            int krkrNPW = 0, krkrNPH = 0;\n'
-                  '            SDL_GetWindowSizeInPixels(tvp_window, &krkrNPW, &krkrNPH);\n'
-                  '            SDL_Log("[patched] iOS window corrected -> %dx%d pixels=%dx%d",\n'
-                  '                    krkrNW, krkrNH, krkrNPW, krkrNPH);\n'
+                  '            /* SDL_SetWindowSize is ignored on iOS (see above); only record the\n'
+                  '               value -- sdl3_utils.cpp / the frame loop read krkrIOSRealSize. */\n'
+                  '            krkrIOSRealW = krkrRealW;\n'
+                  '            krkrIOSRealH = krkrRealH;\n'
+                  '            SDL_Log("[patched] iOS render size pinned to %dx%d "\n'
+                  '                    "(SDL window stays %dx%d; it is owned by the UIKit view)",\n'
+                  '                    krkrIOSRealW, krkrIOSRealH, krkrCurW, krkrCurH);\n'
                   '        }\n'
                   '        else\n'
                   '        {\n'
-                  '            SDL_Log("[patched] iOS window already matches real size");\n'
+                  '            SDL_Log("[patched] iOS real screen size unavailable");\n'
                   '        }\n'
                   '    }',
                   "window-reuse")
@@ -715,7 +730,16 @@ jobs:
                   "    if (sp && sp->width > 0 && sp->height > 0)\n"
                   "    {\n"
                   "        int krkrRW = 0, krkrRH = 0;\n"
-                  "        SDL_GetWindowSize(tvp_window, &krkrRW, &krkrRH);\n"
+                  "        /* r29: SDL reports 480x320 here; prefer the UIKit-measured size. */\n"
+                  "        if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n"
+                  "        {\n"
+                  "            krkrRW = krkrIOSRealW;\n"
+                  "            krkrRH = krkrIOSRealH;\n"
+                  "        }\n"
+                  "        else\n"
+                  "        {\n"
+                  "            SDL_GetWindowSize(tvp_window, &krkrRW, &krkrRH);\n"
+                  "        }\n"
                   "        if (krkrRW > 0 && krkrRH > 0)\n"
                   "        {\n"
                   "            float krkrS = (float)krkrRW / (float)sp->width;\n"
@@ -748,6 +772,46 @@ jobs:
                   "    SDL_RenderTexture(tvp_renderer, (SDL_Texture*)sp->texture, NULL, &rectBuff);\n"
                   "}")
               s1 = sub1(s1, OLDFN, NEWFN, "texrect")
+              s1 = sub1(s1, 'void TVPGetWindowSize(int* w, int* h)\n{\n    SDL_GetWindowSize(tvp_window, w, h);\n}',
+                            'void TVPGetWindowSize(int* w, int* h)\n{\n'
+                            '    /* patched (r29): on iOS SDL only ever reports 480x320 -- the window is\n'
+                            '       fullscreen and its size belongs to the UIKit view.  Prefer the value\n'
+                            '       measured from UIKit so the compositor letterboxes against the real\n'
+                            '       screen instead of a 480x320 canvas that is then upscaled (blur). */\n'
+                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
+                            '    {\n'
+                            '        if (w) *w = krkrIOSRealW;\n'
+                            '        if (h) *h = krkrIOSRealH;\n'
+                            '        return;\n'
+                            '    }\n'
+                            '    SDL_GetWindowSize(tvp_window, w, h);\n}',
+                        "get-window-size")
+              s1 = sub1(s1, 'void TVPGetWindowSizeInPixels(int* w, int* h)\n{\n    SDL_GetWindowSizeInPixels(tvp_window, w, h);\n}',
+                            'void TVPGetWindowSizeInPixels(int* w, int* h)\n{\n'
+                            '    /* patched (r29): see TVPGetWindowSize. */\n'
+                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
+                            '    {\n'
+                            '        if (w) *w = krkrIOSRealW;\n'
+                            '        if (h) *h = krkrIOSRealH;\n'
+                            '        return;\n'
+                            '    }\n'
+                            '    SDL_GetWindowSizeInPixels(tvp_window, w, h);\n}',
+                        "get-window-size-px")
+              s1 = sub1(s1, '    int RW = 1280, RH = 720;\n    SDL_GetWindowSize(tvp_window, &RW, &RH);',
+                            '    int RW = 1280, RH = 720;\n'
+                            '    /* patched (r29): use the UIKit-measured size when we have it; SDL would\n'
+                            '       hand us its own 480x320 fallback and the 1280x720 canvas would be\n'
+                            '       squeezed into a 480x270 letterbox. */\n'
+                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
+                            '    {\n'
+                            '        RW = krkrIOSRealW;\n'
+                            '        RH = krkrIOSRealH;\n'
+                            '    }\n'
+                            '    else\n'
+                            '    {\n'
+                            '        SDL_GetWindowSize(tvp_window, &RW, &RH);\n'
+                            '    }',
+                        "iterate-size")
               save(p1, s1, crlf1)
               print("patched:", p1)
 
@@ -787,6 +851,10 @@ jobs:
           # 1:1 铺满，引擎 contain 给左右黑边 + 完整画面。
           # 输入不受影响：KRKR_Trig_MouseDown 已用 (x-xPos)/scale 把窗口像素反算回
           # 1280x720 贴图坐标，所以改上报尺寸不会点歪。
+          # r29: 这台设备上 SDL_GetCurrentDisplayMode 在 iOS 只给 480x320，所以这个
+          # 上报值必须走 KrkrGetRealScreenSize()，否则 System.screenWidth 依旧是
+          # 480x320，游戏会按 3:2 而非 16:9 排版（r28 日志 `SIZE screen=1280x720`
+          # 那一行是旧补丁硬编码 1280/720 的结果，本轮改为真实值以保持一致）。
           p3 = "src/cpp/environ/sdl3/sdl3_utils.cpp"
           MARK3 = "patched: native design resolution"
           GW = ("int tTVPScreen::GetWidth()\n"
@@ -802,7 +870,12 @@ jobs:
                  "       window (812x375); reporting the wider window size made the game\n"
                  "       cover-fit and crop the top/bottom of its 16:9 content. Input is\n"
                  "       unaffected: KRKR_Trig_MouseDown maps window pixels back to the\n"
-                 "       1280x720 sprite via (x - xPos) / scale. */\n"
+                 "       1280x720 sprite via (x - xPos) / scale.\n"
+                 "       r29: report the REAL screen size when UIKit knows it (grown by the\n"
+                 "       missing UILaunchScreen fix) so the game lays out against the actual\n"
+                 "       device rather than a guess; fall back to the 1280x720 design\n"
+                 "       resolution only when UIKit has nothing to say. */\n"
+                 "    if (krkrIOSRealW > 0) return krkrIOSRealW;\n"
                  "    return 1280;\n"
                  "}")
           s3, crlf3 = load(p3)
@@ -810,8 +883,10 @@ jobs:
               print("already patched:", p3)
           else:
               s3 = sub1(s3, 'bool TVP_stat(const char* name, tTVP_stat& s)',
-                            '/* patched: tvp_window is defined in sdl3_app.cpp. */\n'
+                            '/* patched: tvp_window / krkrIOSReal* are defined in sdl3_app.cpp. */\n'
                             'extern SDL_Window* tvp_window;\n'
+                            'extern int krkrIOSRealW;\n'
+                            'extern int krkrIOSRealH;\n'
                             '\n'
                             'bool TVP_stat(const char* name, tTVP_stat& s)', "extern-window")
               s3 = sub1(s3, GW, GWn, "get-width")
@@ -823,7 +898,9 @@ jobs:
                     "}")
               GHn = ("int tTVPScreen::GetHeight()\n"
                      "{\n"
-                     "    /* patched: native design resolution (height, see GetWidth). */\n"
+                     "    /* patched: native design resolution (height, see GetWidth).\n"
+                     "       r29: real screen size from UIKit when available. */\n"
+                     "    if (krkrIOSRealH > 0) return krkrIOSRealH;\n"
                      "    return 720;\n"
                      "}")
               s3 = sub1(s3, GH, GHn, "get-height")
@@ -843,48 +920,83 @@ jobs:
               "   SDL on iOS reports 480x320 for BOTH the display bounds and the window size\n"
               "   in pixels (see the r27 log line \"iOS display=480x320 window=480x320\n"
               "   pixels=480x320\"), so nothing derived from SDL can tell us the real screen.\n"
-              "   UIScreen.mainScreen.nativeBounds is the PHYSICAL pixel size in the device's\n"
-              "   natural (portrait) orientation and is unaffected by the current rotation, so\n"
-              "   swap the axes when the interface is landscape. */\n"
+              "   r29: the true root cause is the missing UILaunchScreen in Info.plist (see\n"
+              "   ci/inject_and_pack.py) -- iOS was launching the app in legacy compatibility\n"
+              "   scaling, which pins the logical screen to 640x960 (320x480@2x).  With the\n"
+              "   launch screen declared, UIKit hands us the native size; this function reads\n"
+              "   it from the KEY WINDOW (bounds * scale, already in the current orientation)\n"
+              "   and falls back to UIScreen.nativeBounds. */\n"
               "extern \"C\" void KrkrGetRealScreenSize(int* outW, int* outH)\n"
               "{\n"
               "    int w = 0, h = 0;\n"
               "    @autoreleasepool\n"
               "    {\n"
-              "        UIScreen* sc = [UIScreen mainScreen];\n"
-              "        if (sc)\n"
+              "        /* r29: prefer the KEY WINDOW's bounds * its scale.  That value is\n"
+              "           already expressed in the CURRENT interface orientation (no manual\n"
+              "           axis swap needed) and is in physical pixels (scale = 2 or 3).\n"
+              "           UIScreen.nativeBounds is the fallback: it is always given in the\n"
+              "           device's natural PORTRAIT orientation, so the axes have to be\n"
+              "           swapped whenever we are landscape.  r28 only compared the two\n"
+              "           orientation enums and still reported 640x960 (portrait) while the\n"
+              "           window was landscape -- exactly the kind of silent mismatch that\n"
+              "           costs another build, so derive the orientation from the sizes\n"
+              "           themselves instead of trusting an enum. */\n"
+              "        UIWindow* krkrKeyWin = nil;\n"
+              "        UIWindowScene* krkrScene = nil;\n"
+              "        for (UIScene* s in UIApplication.sharedApplication.connectedScenes)\n"
               "        {\n"
-              "            CGRect nb = [sc nativeBounds];\n"
+              "            if (![s isKindOfClass:UIWindowScene.class])\n"
+              "                continue;\n"
+              "            UIWindowScene* ws = (UIWindowScene*)s;\n"
+              "            for (UIWindow* ww in ws.windows)\n"
+              "            {\n"
+              "                if (ww.isKeyWindow) { krkrKeyWin = ww; break; }\n"
+              "            }\n"
+              "            if (!krkrKeyWin && ws.windows.count)\n"
+              "                krkrKeyWin = ws.windows.firstObject;\n"
+              "            if (krkrKeyWin) { krkrScene = ws; break; }\n"
+              "        }\n"
+              "        float krkrScale = 0.0f;\n"
+              "        CGRect krkrBounds = CGRectZero;\n"
+              "        if (krkrKeyWin)\n"
+              "        {\n"
+              "            krkrScale = krkrKeyWin.screen ? krkrKeyWin.screen.scale\n"
+              "                                          : [UIScreen mainScreen].scale;\n"
+              "            krkrBounds = krkrKeyWin.bounds;\n"
+              "        }\n"
+              "        if (krkrBounds.size.width > 0 && krkrBounds.size.height > 0 && krkrScale > 0)\n"
+              "        {\n"
+              "            w = (int)(krkrBounds.size.width * krkrScale + 0.5);\n"
+              "            h = (int)(krkrBounds.size.height * krkrScale + 0.5);\n"
+              "        }\n"
+              "        else\n"
+              "        {\n"
+              "            UIScreen* sc = [UIScreen mainScreen];\n"
+              "            CGRect nb = sc ? [sc nativeBounds] : CGRectZero;\n"
               "            w = (int)(nb.size.width + 0.5);\n"
               "            h = (int)(nb.size.height + 0.5);\n"
               "            UIInterfaceOrientation o = UIInterfaceOrientationUnknown;\n"
               "            if (@available(iOS 13.0, *))\n"
               "            {\n"
-              "                for (UIScene* s in UIApplication.sharedApplication.connectedScenes)\n"
-              "                {\n"
-              "                    if ([s isKindOfClass:UIWindowScene.class])\n"
-              "                    {\n"
-              "                        o = ((UIWindowScene*)s).interfaceOrientation;\n"
-              "                        break;\n"
-              "                    }\n"
-              "                }\n"
+              "                if (krkrScene)\n"
+              "                    o = krkrScene.interfaceOrientation;\n"
               "            }\n"
               "            if (o == UIInterfaceOrientationUnknown)\n"
               "            {\n"
               "                for (UIWindow* ww in UIApplication.sharedApplication.windows)\n"
               "                {\n"
               "                    if (ww.windowScene)\n"
-              "                    {\n"
-              "                        o = ww.windowScene.interfaceOrientation;\n"
-              "                        break;\n"
-              "                    }\n"
+              "                    { o = ww.windowScene.interfaceOrientation; break; }\n"
               "                }\n"
               "            }\n"
-              "            if (o == UIInterfaceOrientationLandscapeLeft ||\n"
-              "                o == UIInterfaceOrientationLandscapeRight)\n"
-              "            {\n"
-              "                int t = w; w = h; h = t;\n"
-              "            }\n"
+              "            BOOL krkrLandscape = (o == UIInterfaceOrientationLandscapeLeft ||\n"
+              "                                  o == UIInterfaceOrientationLandscapeRight);\n"
+              "            /* 方向枚举不可靠时，用 nativeBounds 自身的形状兜底：\n"
+              "               竖屏机型上 w < h，一旦 w > h 就说明是横屏基准。 */\n"
+              "            if (o == UIInterfaceOrientationUnknown && w > h)\n"
+              "                krkrLandscape = YES;\n"
+              "            if (krkrLandscape)\n"
+              "            { int t = w; w = h; h = t; }\n"
               "        }\n"
               "    }\n"
               "    if (outW) *outW = w;\n"
@@ -915,6 +1027,12 @@ jobs:
           echo "--- verify: real screen size from UIKit ---"
           grep -n "KrkrGetRealScreenSize" src/cpp/environ/iOS/ios_core.mm || true
           grep -n "KrkrGetRealScreenSize" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: r29 real-size globals + consumers ---"
+          grep -n "^int krkrIOSRealW = 0;" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          grep -n "krkrIOSRealW" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          grep -n "extern int krkrIOSRealW;" src/cpp/environ/sdl3/sdl3_utils.cpp || true
+          echo "--- verify: SDL_SetWindowSize no longer called (it is ignored on iOS) ---"
+          grep -c "SDL_SetWindowSize(tvp_window, krkrRealW" src/cpp/environ/sdl3/sdl3_app.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
