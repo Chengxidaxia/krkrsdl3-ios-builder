@@ -322,7 +322,7 @@ jobs:
               print("patched:", p)
           PYEOF
           echo "--- verify ---"
-          grep -n -A 3 "storage miss: " src/cpp/core/archive/TVPStorage.cpp | head -6
+          grep -n -A 3 "storage miss: " src/cpp/core/archive/TVPStorage.cpp | head -6 || true
 
       - name: Patch iOS tjs2 exception logging (message + position + block dump)
         run: |
@@ -463,28 +463,18 @@ jobs:
           python3 - <<'PYEOF'
           import io, sys
 
-          # 说明（r22 的目标：绕开 iOS 上不可用的 GL 呈现路径）
-          #   r18/r21 的日志证明引擎侧一切正常：winVisible=1 waitVSync=0 sprite=1
-          #   sprVisible=1 tex=1，脚本/数据零异常；r21 又把 GLRenderBackend::BeginFrame
-          #   的清屏改成绿色，屏幕连绿色都不出现 => GL 的输出根本没有到达显示。
-          #   iOS 上 OpenGL ES 已被 Apple 废弃，SDL3 的 GL/EAGL 呈现路径不可靠。
+          # r22 之后的收尾（画面已经出来了）：
+          #   -render=software 保持不变（iOS 上必须走 SDL_Renderer/Metal，
+          #   GL/EAGL 的呈现通路上不了屏）；本轮把两处排查用的痕迹清掉：
+          #     (1) 软渲染清屏色 绿 -> 不透明黑（正常 letterbox 黑边）；
+          #     (2) 关掉 TVPIsExistentStorage() 里的 "[dbg] storage miss" 日志
+          #         —— 游戏每次运行会做几千次存在性检查（上次日志 9771 条），
+          #         每条都写文件，在手机上是实打实的 I/O 负担。
           #
-          #   所以这一轮：
-          #     (1) 在 iOS 自己合成的命令行里追加 -render=software，改走 SDL_Renderer
-          #         （iOS 上 SDL 会选 metal 驱动），呈现走 SDL_RenderPresent；
-          #     (2) 把软渲染路径的每帧清屏色也改成绿色，用来判读软渲染是否真的上屏；
-          #     (3) 保留原有的 VBlank present 补丁与管线状态日志。
-          #
-          #   判读（用户看屏幕 + 日志）：
-          #     日志出现 "Selected Render: software" 和 "SWRender Backend: <驱动名>"，
-          #     屏幕出现绿色 => 软渲染通路有效，游戏画面随后应能出现；
-          #     仍然全黑      => 问题在 iOS 的 SDL 视图层，与渲染后端无关。
-          #
-          #   ★ 本文件在 iOS 上走 _KRKRSDL3_GLES 分支，只 include glad/glad_egl.h，
-          #     没有 GL 核心函数声明 —— 这一段不能出现任何 gl* 调用（run#19 的教训）。
-          #   ★ 本文件是 CRLF，多行处理一律先归一化成 LF，写回时再恢复。
-          p = "src/cpp/environ/sdl3/sdl3_app.cpp"
-          MARK = "[patched] iOS opt"
+          # ★ sdl3_app.cpp 在 iOS 上只 include glad/glad_egl.h，不能出现任何 gl* 调用。
+          # ★ 该文件是 CRLF；多行锚点先归一化成 LF，写回时恢复。
+          p1 = "src/cpp/environ/sdl3/sdl3_app.cpp"
+          MARK1 = "-render=software"
           A = "    krkrsdl3::TVPRenderOnce(RW, RH);"
           D = (
               "    /* patched: VBlank present step + pipeline diagnostics */\n"
@@ -502,8 +492,6 @@ jobs:
               "                    + TJS_N(\" winVisible=\") + ttstr((tjs_int)(krkrWin->GetVisible() ? 1 : 0))\n"
               "                    + TJS_N(\" waitVSync=\") + ttstr((tjs_int)(krkrWin->GetWaitVSync() ? 1 : 0))\n"
               "                    + TJS_N(\" sprite=\") + ttstr((tjs_int)(krkrSpr ? 1 : 0))\n"
-              "                    + TJS_N(\" sprVisible=\") + ttstr((tjs_int)((krkrSpr && krkrSpr->isVisible) ? 1 : 0))\n"
-              "                    + TJS_N(\" tex=\") + ttstr((tjs_int)((krkrSpr && krkrSpr->texture) ? 1 : 0))\n"
               "                    + TJS_N(\" win=\") + ttstr((tjs_int)RW) + TJS_N(\"x\") + ttstr((tjs_int)RH));\n"
               "            }\n"
               "            if (krkrSpr && !krkrSpr->isVisible && krkrDbgFrame < 600)\n"
@@ -539,56 +527,67 @@ jobs:
               print("   ok:", tag)
               return s.replace(old, new)
 
-          s, crlf = load(p)
-          print("sdl3_app.cpp crlf=%s" % crlf)
-          if MARK in s:
-              print("already patched:", p)
+          s1, crlf1 = load(p1)
+          print("sdl3_app.cpp crlf=%s" % crlf1)
+          if MARK1 in s1:
+              print("already patched:", p1)
           else:
-              s = sub1(s, A, D, "present-block")
-              s = sub1(s, '        static char* s_argv[2];',
-                          '        static char s_opt[] = "-render=software";\n'
-                          '        static char* s_argv[3];', "argv-size")
-              s = sub1(s, '            s_argv[1] = s_dat;',
-                          '            s_argv[1] = s_dat;\n'
-                          '            s_argv[2] = s_opt;', "argv-option")
-              s = sub1(s, '            SDL_Log("[patched] iOS data : %s", s_dat);',
-                          '            SDL_Log("[patched] iOS data : %s", s_dat);\n'
-                          '            SDL_Log("[patched] iOS opt  : %s", s_opt);', "opt-log")
-              s = sub1(s, '        argc = 2; argv = s_argv;',
-                          '        argc = 3; argv = s_argv;', "argc")
-              s = sub1(s, '    SDL_SetRenderDrawColor(tvp_renderer, 0, 0, 0, 0);',
-                          '    /* patched: green clear (diagnostic) for the software/SDL path */\n'
-                          '    SDL_SetRenderDrawColor(tvp_renderer, 0, 255, 0, 255);', "sw-clear")
-              save(p, s, crlf)
-              print("patched:", p)
+              s1 = sub1(s1, A, D, "present-block")
+              s1 = sub1(s1, '        static char* s_argv[2];',
+                            '        static char s_opt[] = "-render=software";\n'
+                            '        static char* s_argv[3];', "argv-size")
+              s1 = sub1(s1, '            s_argv[1] = s_dat;',
+                            '            s_argv[1] = s_dat;\n'
+                            '            s_argv[2] = s_opt;', "argv-option")
+              s1 = sub1(s1, '            SDL_Log("[patched] iOS data : %s", s_dat);',
+                            '            SDL_Log("[patched] iOS data : %s", s_dat);\n'
+                            '            SDL_Log("[patched] iOS opt  : %s", s_opt);', "opt-log")
+              s1 = sub1(s1, '        argc = 2; argv = s_argv;',
+                            '        argc = 3; argv = s_argv;', "argc")
+              s1 = sub1(s1, '    SDL_SetRenderDrawColor(tvp_renderer, 0, 0, 0, 0);',
+                            '    /* patched: opaque black letterbox (was bright green while we were\n'
+                            '       proving that the software path really reaches the screen). */\n'
+                            '    SDL_SetRenderDrawColor(tvp_renderer, 0, 0, 0, 255);', "sw-clear")
+              save(p1, s1, crlf1)
+              print("patched:", p1)
 
-          # ---- GLRenderBackend.cpp：保留 GL 路径的绿清屏（万一又走回 GL）----
-          p2 = "src/cpp/core/render/backend/GLRenderBackend.cpp"
-          MARK2 = "patched: green clear"
-          A2 = ("    glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
-                "    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);\n"
-                "    glDisable(GL_DEPTH_TEST);")
-          D2 = ("    glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
-                "    /* patched: green clear (diagnostic). Green on screen => the GL present\n"
-                "       path really reaches the display; still black => it does not. */\n"
-                "    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);\n"
-                "    glDisable(GL_DEPTH_TEST);")
+          # ---- TVPStorage.cpp：关掉 storage-miss 日志（性能）----
+          p2 = "src/cpp/core/archive/TVPStorage.cpp"
+          A2 = ("bool TVPIsExistentStorage(const ttstr& name)\n"
+                "{\n"
+                "    ttstr krkrPlaced = TVPGetPlacedPath(name);\n"
+                "    if (krkrPlaced.IsEmpty())\n"
+                "    {\n"
+                "        /* patched: log which storage the game checks and misses --\n"
+                "           existence checks fail silently otherwise. */\n"
+                '        TVPAddLog(TJS_N("[dbg] storage miss: ") + name);\n'
+                "    }\n"
+                "    return !krkrPlaced.IsEmpty();\n"
+                "}")
+          D2 = ("bool TVPIsExistentStorage(const ttstr& name)\n"
+                "{\n"
+                "    /* patched: miss logging removed -- it was a bring-up diagnostic, and the\n"
+                "       game performs thousands of existence checks per run; each log line\n"
+                "       costs file I/O on a phone. Back to the plain implementation. */\n"
+                "    return !TVPGetPlacedPath(name).IsEmpty();\n"
+                "}")
+          MARK2 = "miss logging removed"
           s2, crlf2 = load(p2)
           if MARK2 in s2:
               print("already patched:", p2)
           else:
-              s2 = sub1(s2, A2, D2, "gl-clear")
+              s2 = sub1(s2, A2, D2, "miss-log-removal")
               save(p2, s2, crlf2)
               print("patched:", p2, "crlf=%s" % crlf2)
           PYEOF
-          echo "--- verify: render option injected ---"
+          echo "--- verify: render option kept ---"
           grep -c "render=software" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          echo "--- verify: no gl* calls added to sdl3_app.cpp (run#19 build error) ---"
-          grep -c "colour test" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          echo "--- verify: software clear is green ---"
+          echo "--- verify: letterbox is opaque black now ---"
           grep -n "SDL_SetRenderDrawColor" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          echo "--- verify: green clear in GLRenderBackend ---"
-          grep -n "patched: green clear" src/cpp/core/render/backend/GLRenderBackend.cpp || true
+          echo "--- verify: miss logging removed ---"
+          grep -c "storage miss: " src/cpp/core/archive/TVPStorage.cpp || true
+          echo "--- verify: miss logging removal marker ---"
+          grep -n "miss logging removed" src/cpp/core/archive/TVPStorage.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
