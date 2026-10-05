@@ -117,7 +117,7 @@ jobs:
           echo "--- verify: includes ---"
           sed -n '1,12p' src/cpp/environ/sdl3/sdl3_app.cpp
           echo "--- verify: injected block ---"
-          grep -n -A 4 "SDL_AppResult SDL_AppInit" src/cpp/environ/sdl3/sdl3_app.cpp | head -10
+          grep -n -A 4 "SDL_AppResult SDL_AppInit" src/cpp/environ/sdl3/sdl3_app.cpp | head -10 || true
 
       - name: Patch 7zCrc (disable ARM HW CRC for Apple clang)
         run: |
@@ -463,20 +463,28 @@ jobs:
           python3 - <<'PYEOF'
           import io, sys
 
-          # ---- 1) environ/sdl3/sdl3_app.cpp --------------------------------
-          # 移植缺陷：TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）全工程没有调用者，
-          # 而 TVPWindow::UpdateContent() 只在 WaitVSync=false 且窗口可见时才 Show()。
-          # 这里每帧补上，并把管线状态打进 stderr。
+          # 说明（r22 的目标：绕开 iOS 上不可用的 GL 呈现路径）
+          #   r18/r21 的日志证明引擎侧一切正常：winVisible=1 waitVSync=0 sprite=1
+          #   sprVisible=1 tex=1，脚本/数据零异常；r21 又把 GLRenderBackend::BeginFrame
+          #   的清屏改成绿色，屏幕连绿色都不出现 => GL 的输出根本没有到达显示。
+          #   iOS 上 OpenGL ES 已被 Apple 废弃，SDL3 的 GL/EAGL 呈现路径不可靠。
           #
-          # ★ 本文件在 iOS 上走 _KRKRSDL3_GLES 分支，只 include glad/glad_egl.h，
-          #   **没有 GL 核心函数声明**（glClear / glScissor / glBindFramebuffer 等一律
-          #   编译失败 —— run#19 就是挂在这里）。所以这一段只做与 GL 无关的事；
-          #   需要 GL 的诊断放到 core/render/backend/GLRenderBackend.cpp。
+          #   所以这一轮：
+          #     (1) 在 iOS 自己合成的命令行里追加 -render=software，改走 SDL_Renderer
+          #         （iOS 上 SDL 会选 metal 驱动），呈现走 SDL_RenderPresent；
+          #     (2) 把软渲染路径的每帧清屏色也改成绿色，用来判读软渲染是否真的上屏；
+          #     (3) 保留原有的 VBlank present 补丁与管线状态日志。
           #
-          # 注意行尾：本文件是 CRLF。锚点是不含换行的单行，所以不受影响；
-          # 多行锚点必须先把 CRLF 归一化（见第 2 段）。
+          #   判读（用户看屏幕 + 日志）：
+          #     日志出现 "Selected Render: software" 和 "SWRender Backend: <驱动名>"，
+          #     屏幕出现绿色 => 软渲染通路有效，游戏画面随后应能出现；
+          #     仍然全黑      => 问题在 iOS 的 SDL 视图层，与渲染后端无关。
+          #
+          #   ★ 本文件在 iOS 上走 _KRKRSDL3_GLES 分支，只 include glad/glad_egl.h，
+          #     没有 GL 核心函数声明 —— 这一段不能出现任何 gl* 调用（run#19 的教训）。
+          #   ★ 本文件是 CRLF，多行处理一律先归一化成 LF，写回时再恢复。
           p = "src/cpp/environ/sdl3/sdl3_app.cpp"
-          MARK = "[dbg] frame "
+          MARK = "[patched] iOS opt"
           A = "    krkrsdl3::TVPRenderOnce(RW, RH);"
           D = (
               "    /* patched: VBlank present step + pipeline diagnostics */\n"
@@ -513,26 +521,48 @@ jobs:
               "    }\n"
               + A + "\n"
           )
-          src = io.open(p, encoding="utf-8", newline="").read()
-          if MARK in src:
+
+          def load(path):
+              raw = io.open(path, "rb").read()
+              return raw.decode("utf-8").replace("\r\n", "\n"), (b"\r\n" in raw)
+
+          def save(path, s, crlf):
+              io.open(path, "wb").write((s.replace("\n", "\r\n") if crlf else s).encode("utf-8"))
+
+          def sub1(s, old, new, tag):
+              n = s.count(old)
+              if n != 1:
+                  i = s.find(old)
+                  sys.stderr.write("ANCHOR MISS [%s] count=%d @%d\n%s\n"
+                                   % (tag, n, i, s[max(0, i - 200):i + 300]))
+                  raise SystemExit(1)
+              print("   ok:", tag)
+              return s.replace(old, new)
+
+          s, crlf = load(p)
+          print("sdl3_app.cpp crlf=%s" % crlf)
+          if MARK in s:
               print("already patched:", p)
           else:
-              if src.count(A) != 1:
-                  i = src.find("TVPRenderOnce")
-                  sys.stderr.write("ANCHOR MISS (%d); context:\n%s\n" % (src.count(A), src[i - 200:i + 200]))
-                  raise SystemExit(1)
-              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D))
+              s = sub1(s, A, D, "present-block")
+              s = sub1(s, '        static char* s_argv[2];',
+                          '        static char s_opt[] = "-render=software";\n'
+                          '        static char* s_argv[3];', "argv-size")
+              s = sub1(s, '            s_argv[1] = s_dat;',
+                          '            s_argv[1] = s_dat;\n'
+                          '            s_argv[2] = s_opt;', "argv-option")
+              s = sub1(s, '            SDL_Log("[patched] iOS data : %s", s_dat);',
+                          '            SDL_Log("[patched] iOS data : %s", s_dat);\n'
+                          '            SDL_Log("[patched] iOS opt  : %s", s_opt);', "opt-log")
+              s = sub1(s, '        argc = 2; argv = s_argv;',
+                          '        argc = 3; argv = s_argv;', "argc")
+              s = sub1(s, '    SDL_SetRenderDrawColor(tvp_renderer, 0, 0, 0, 0);',
+                          '    /* patched: green clear (diagnostic) for the software/SDL path */\n'
+                          '    SDL_SetRenderDrawColor(tvp_renderer, 0, 255, 0, 255);', "sw-clear")
+              save(p, s, crlf)
               print("patched:", p)
 
-          # ---- 2) core/render/backend/GLRenderBackend.cpp -------------------
-          # 着色实验（run#20）：把每帧清屏色从黑改成绿。只改一个常量、不引入任何新
-          # 符号（本文件本来就 include 了 glad）。判读：
-          #   屏幕出现绿色(哪怕只是上下两条边，因为窗口纹理 1280x720 会 letterbox
-          #   到 480x270 居中) => GL 呈现通路确实到达屏幕，黑屏是「内容/视口」问题；
-          #   仍然全黑                        => 呈现通路坏，下一步切 software 后端。
-          #
-          # ★ 多行锚点必须先归一化行尾：上游 checkout 出来的文件可能是 CRLF，
-          #   而锚点里的 \n 在 CRLF 文件里匹配不到（run#20 之前的隐患）。
+          # ---- GLRenderBackend.cpp：保留 GL 路径的绿清屏（万一又走回 GL）----
           p2 = "src/cpp/core/render/backend/GLRenderBackend.cpp"
           MARK2 = "patched: green clear"
           A2 = ("    glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
@@ -543,30 +573,22 @@ jobs:
                 "       path really reaches the display; still black => it does not. */\n"
                 "    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);\n"
                 "    glDisable(GL_DEPTH_TEST);")
-          raw2 = io.open(p2, "rb").read()
-          crlf2 = b"\r\n" in raw2
-          s2 = raw2.decode("utf-8")
-          if crlf2:
-              s2 = s2.replace("\r\n", "\n")
+          s2, crlf2 = load(p2)
           if MARK2 in s2:
               print("already patched:", p2)
           else:
-              if s2.count(A2) != 1:
-                  i = s2.find("glClearColor")
-                  sys.stderr.write("ANCHOR MISS (%d) crlf=%s; context:\n%s\n" % (s2.count(A2), crlf2, s2[i - 200:i + 200]))
-                  raise SystemExit(1)
-              s2 = s2.replace(A2, D2)
-              if crlf2:
-                  s2 = s2.replace("\n", "\r\n")
-              io.open(p2, "wb").write(s2.encode("utf-8"))
-              print("patched:", p2, "(crlf=%s)" % crlf2)
+              s2 = sub1(s2, A2, D2, "gl-clear")
+              save(p2, s2, crlf2)
+              print("patched:", p2, "crlf=%s" % crlf2)
           PYEOF
-          echo "--- verify: namespace qualifier (run#17 build error) ---"
-          grep -c "krkrsdl3::KRKR_Get_Current_Sprite" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          echo "--- verify: stale colour-test block removed from sdl3_app.cpp (expect 0) ---"
+          echo "--- verify: render option injected ---"
+          grep -c "render=software" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: no gl* calls added to sdl3_app.cpp (run#19 build error) ---"
           grep -c "colour test" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          echo "--- verify: green clear in place ---"
-          grep -n "patched: green clear" -A 2 src/cpp/core/render/backend/GLRenderBackend.cpp || true
+          echo "--- verify: software clear is green ---"
+          grep -n "SDL_SetRenderDrawColor" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: green clear in GLRenderBackend ---"
+          grep -n "patched: green clear" src/cpp/core/render/backend/GLRenderBackend.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
