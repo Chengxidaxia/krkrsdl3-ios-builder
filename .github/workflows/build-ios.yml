@@ -643,13 +643,15 @@ jobs:
               save(p2, s2, crlf2)
               print("patched:", p2, "crlf=%s" % crlf2)
 
-          # ---- 3) 屏幕尺寸：iOS 上 SDL_GetCurrentDisplayMode 报的是竖屏 ----
-          # 日志实测 System.screenWidth x screenHeight = 375x812（竖屏），而窗口是横屏
-          # 812x375。游戏据此把 UI 按"屏幕高 812"摆放，于是画面下半部分落到 720 的画面
-          # 之外 —— 这就是"底部被截断"。改成优先返回真实窗口尺寸。
-          # 前提：tvp_window 已由上面 export-window 去掉 static（本步骤同一轮里完成）。
+          # ---- 3) 屏幕尺寸：让游戏按原生 16:9 设计分辨率(1280x720)布局 ----
+          # 根因：之前上报真实窗口 812x375（比 16:9 更宽），游戏据此把 16:9 内容用
+          # cover 铺满 -> 上下被裁；引擎 contain 只负责左右留黑边，最终是
+          # 「左右黑边 + 内容没全」。改成上报 1280x720（= 主层/贴图尺寸），游戏按
+          # 1:1 铺满，引擎 contain 给左右黑边 + 完整画面。
+          # 输入不受影响：KRKR_Trig_MouseDown 已用 (x-xPos)/scale 把窗口像素反算回
+          # 1280x720 贴图坐标，所以改上报尺寸不会点歪。
           p3 = "src/cpp/environ/sdl3/sdl3_utils.cpp"
-          MARK3 = "patched: real window size"
+          MARK3 = "patched: native design resolution"
           GW = ("int tTVPScreen::GetWidth()\n"
                 "{\n"
                 "    SDL_DisplayID display = SDL_GetPrimaryDisplay();\n"
@@ -658,17 +660,13 @@ jobs:
                 "}")
           GWn = ("int tTVPScreen::GetWidth()\n"
                  "{\n"
-                 "    /* patched: real window size -- on iOS SDL_GetCurrentDisplayMode()\n"
-                 "       keeps reporting the portrait mode (375x812) although the window\n"
-                 "       is landscape (812x375), which makes the game lay its UI out for\n"
-                 "       a portrait screen and pushes the bottom of the picture outside\n"
-                 "       the visible area. */\n"
-                 "    int krkrW = 0, krkrH = 0;\n"
-                 "    if (tvp_window && SDL_GetWindowSize(tvp_window, &krkrW, &krkrH) && krkrW > 0)\n"
-                 "        return krkrW;\n"
-                 "    SDL_DisplayID display = SDL_GetPrimaryDisplay();\n"
-                 "    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);\n"
-                 "    return mode ? mode->w : 0;\n"
+                 "    /* patched: native design resolution (1280x720, 16:9); the engine letterboxes\n"
+                 "       The engine letterboxes the 1280x720 primary layer into the real\n"
+                 "       window (812x375); reporting the wider window size made the game\n"
+                 "       cover-fit and crop the top/bottom of its 16:9 content. Input is\n"
+                 "       unaffected: KRKR_Trig_MouseDown maps window pixels back to the\n"
+                 "       1280x720 sprite via (x - xPos) / scale. */\n"
+                 "    return 1280;\n"
                  "}")
           s3, crlf3 = load(p3)
           if MARK3 in s3:
@@ -680,11 +678,17 @@ jobs:
                             '\n'
                             'bool TVP_stat(const char* name, tTVP_stat& s)', "extern-window")
               s3 = sub1(s3, GW, GWn, "get-width")
-              GH = GW.replace('GetWidth', 'GetHeight').replace('mode->w', 'mode->h')
-              GHn = (GWn.replace('GetWidth', 'GetHeight')
-                        .replace('krkrW > 0', 'krkrH > 0')
-                        .replace('return krkrW;', 'return krkrH;')
-                        .replace('mode->w', 'mode->h'))
+              GH = ("int tTVPScreen::GetHeight()\n"
+                    "{\n"
+                    "    SDL_DisplayID display = SDL_GetPrimaryDisplay();\n"
+                    "    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);\n"
+                    "    return mode ? mode->h : 0;\n"
+                    "}")
+              GHn = ("int tTVPScreen::GetHeight()\n"
+                     "{\n"
+                     "    /* patched: native design resolution (height, see GetWidth). */\n"
+                     "    return 720;\n"
+                     "}")
               s3 = sub1(s3, GH, GHn, "get-height")
               save(p3, s3, crlf3)
               print("patched:", p3, "crlf=%s" % crlf3)
@@ -697,8 +701,8 @@ jobs:
           grep -c "storage miss: " src/cpp/core/archive/TVPStorage.cpp || true
           echo "--- verify: miss logging removal marker ---"
           grep -n "miss logging removed" src/cpp/core/archive/TVPStorage.cpp || true
-          echo "--- verify: screen size reports the real window ---"
-          grep -n "patched: real window size" src/cpp/environ/sdl3/sdl3_utils.cpp || true
+          echo "--- verify: screen size reports native design resolution (1280x720) ---"
+          grep -n "patched: native design resolution" src/cpp/environ/sdl3/sdl3_utils.cpp || true
           echo "--- verify: tvp_window exported ---"
           grep -n "^SDL_Window\* tvp_window;" src/cpp/environ/sdl3/sdl3_app.cpp || true
           echo "--- verify: forced letterbox in place ---"
