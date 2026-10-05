@@ -554,6 +554,63 @@ jobs:
                             'SDL_Window* tvp_window;   /* patched: was static; exported so that the\n'
                             '                             screen-size queries can report the real window */',
                         "export-window")
+              # ---- 最终出口强制 letterbox（r23 实测：上游传来的矩形是"铺满宽度"，上下溢出）----
+              OLDFN = (
+                  "void TVPRenderTextureBackend(TVPSprite* sp, int posX, int posY, int width, int height)\n"
+                  "{\n"
+                  "    SDL_FRect rectBuff;\n"
+                  "    rectBuff.x = posX;\n"
+                  "    rectBuff.y = posY;\n"
+                  "    rectBuff.w = width;\n"
+                  "    rectBuff.h = height;\n"
+                  "    SDL_RenderTexture(tvp_renderer, (SDL_Texture*)sp->texture, NULL, &rectBuff);\n"
+                  "}")
+              NEWFN = (
+                  "void TVPRenderTextureBackend(TVPSprite* sp, int posX, int posY, int width, int height)\n"
+                  "{\n"
+                  "#if defined(_KRKRSDL3_IOS)\n"
+                  "    /* patched: force aspect-correct letterboxing. r23 evidence:\n"
+                  "       spr=1280x720 win=812x375 yet the picture arrived width-fitted\n"
+                  "       (812x456) with top and bottom cropped, so the incoming rect does\n"
+                  "       not use the min-scale fit. Recompute the destination rect from\n"
+                  "       the texture's own aspect ratio; the whole picture always fits. */\n"
+                  "    static int krkrLogged = 0;\n"
+                  "    if (sp && sp->width > 0 && sp->height > 0)\n"
+                  "    {\n"
+                  "        int krkrRW = 0, krkrRH = 0;\n"
+                  "        SDL_GetWindowSize(tvp_window, &krkrRW, &krkrRH);\n"
+                  "        if (krkrRW > 0 && krkrRH > 0)\n"
+                  "        {\n"
+                  "            float krkrS = (float)krkrRW / (float)sp->width;\n"
+                  "            float krkrS2 = (float)krkrRH / (float)sp->height;\n"
+                  "            if (krkrS2 < krkrS)\n"
+                  "                krkrS = krkrS2;\n"
+                  "            int krkrNW = (int)((float)sp->width * krkrS);\n"
+                  "            int krkrNH = (int)((float)sp->height * krkrS);\n"
+                  "            int krkrNX = (krkrRW - krkrNW) / 2;\n"
+                  "            int krkrNY = (krkrRH - krkrNH) / 2;\n"
+                  "            if (!krkrLogged)\n"
+                  "            {\n"
+                  "                krkrLogged = 1;\n"
+                  "                SDL_Log(\"[dbg] texrect in=(%d,%d,%d,%d) out=(%d,%d,%d,%d) tex=%dx%d win=%dx%d\",\n"
+                  "                    posX, posY, width, height, krkrNX, krkrNY, krkrNW, krkrNH,\n"
+                  "                    sp->width, sp->height, krkrRW, krkrRH);\n"
+                  "            }\n"
+                  "            posX = krkrNX;\n"
+                  "            posY = krkrNY;\n"
+                  "            width = krkrNW;\n"
+                  "            height = krkrNH;\n"
+                  "        }\n"
+                  "    }\n"
+                  "#endif\n"
+                  "    SDL_FRect rectBuff;\n"
+                  "    rectBuff.x = (float)posX;\n"
+                  "    rectBuff.y = (float)posY;\n"
+                  "    rectBuff.w = (float)width;\n"
+                  "    rectBuff.h = (float)height;\n"
+                  "    SDL_RenderTexture(tvp_renderer, (SDL_Texture*)sp->texture, NULL, &rectBuff);\n"
+                  "}")
+              s1 = sub1(s1, OLDFN, NEWFN, "texrect")
               save(p1, s1, crlf1)
               print("patched:", p1)
 
@@ -644,6 +701,8 @@ jobs:
           grep -n "patched: real window size" src/cpp/environ/sdl3/sdl3_utils.cpp || true
           echo "--- verify: tvp_window exported ---"
           grep -n "^SDL_Window\* tvp_window;" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: forced letterbox in place ---"
+          grep -n "force aspect-correct letterboxing" src/cpp/environ/sdl3/sdl3_app.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
