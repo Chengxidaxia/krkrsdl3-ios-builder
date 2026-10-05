@@ -464,9 +464,17 @@ jobs:
           import io
           # 移植缺陷：TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）在全工程没有任何
           # 调用者，而 TVPWindow::UpdateContent() 只在 WaitVSync 为 false 时调用
-          # DrawDevice->Show()。两者叠加 => 窗口可能永远不被呈现 => App 在跑却黑屏。
-          # 这里在每帧回调里补上这一步，并把管线状态（窗口可见性 / waitVSync /
-          # sprite / 贴图 / 窗口尺寸）打进 stderr；同时把可见性与 waitVSync 纠正回来。
+          # DrawDevice->Show()，且只在该窗口可见时才被事件派发。两者叠加 => 窗口可能
+          # 永远不被呈现 => App 在跑却黑屏。这里在每帧回调里补上这一步，并把管线状态
+          # （窗口可见性 / waitVSync / sprite / 贴图 / 窗口尺寸）打进 stderr。
+          #
+          # 符号已逐个核对：
+          #   TVPGetActiveWindow()            core/main/WindowManager.h（全局）
+          #   TVPWindow::DeliverDrawDeviceShow / GetVisible / SetVisible /
+          #   GetWaitVSync / SetWaitVSync     core/main/TVPWindow.h（public）
+          #   krkrsdl3::KRKR_Get_Current_Sprite  core/main/WindowManager.h（注意命名空间）
+          #   TVPSprite 成员 isVisible/texture   environ/PlatformView.h（经 TVPWindow.h 引入）
+          #   TVPAddImportantLog              core/msg/TVPDebug.h（sdl3_app.cpp 已 include）
           p = "src/cpp/environ/sdl3/sdl3_app.cpp"
           MARK = "[dbg] frame "
           A = "    krkrsdl3::TVPRenderOnce(RW, RH);"
@@ -477,27 +485,29 @@ jobs:
               "        TVPWindow* krkrWin = TVPGetActiveWindow();\n"
               "        if (krkrWin)\n"
               "        {\n"
+              "            TVPSprite* krkrSpr = krkrsdl3::KRKR_Get_Current_Sprite();\n"
               "            krkrWin->DeliverDrawDeviceShow();\n"
               "            krkrDbgFrame++;\n"
               "            if (krkrDbgFrame == 30 || krkrDbgFrame == 300 || krkrDbgFrame == 1200)\n"
               "            {\n"
-              "                TVPSprite* krkrSpr = KRKR_Get_Current_Sprite();\n"
-              "                TVPAddImportantLog(ttstr(TJS_N(\"[dbg] frame \")) + ttstr(krkrDbgFrame)\n"
-              "                    + TJS_N(\" winVisible=\") + ttstr((int)(krkrWin->GetVisible() ? 1 : 0))\n"
-              "                    + TJS_N(\" waitVSync=\") + ttstr((int)(krkrWin->GetWaitVSync() ? 1 : 0))\n"
-              "                    + TJS_N(\" sprite=\") + ttstr((int)(krkrSpr ? 1 : 0))\n"
-              "                    + TJS_N(\" tex=\") + ttstr((int)((krkrSpr && krkrSpr->texture) ? 1 : 0))\n"
-              "                    + TJS_N(\" win=\") + ttstr(RW) + TJS_N(\"x\") + ttstr(RH));\n"
+              "                TVPAddImportantLog(ttstr(TJS_N(\"[dbg] frame \")) + ttstr((tjs_int)krkrDbgFrame)\n"
+              "                    + TJS_N(\" winVisible=\") + ttstr((tjs_int)(krkrWin->GetVisible() ? 1 : 0))\n"
+              "                    + TJS_N(\" waitVSync=\") + ttstr((tjs_int)(krkrWin->GetWaitVSync() ? 1 : 0))\n"
+              "                    + TJS_N(\" sprite=\") + ttstr((tjs_int)(krkrSpr ? 1 : 0))\n"
+              "                    + TJS_N(\" sprVisible=\") + ttstr((tjs_int)((krkrSpr && krkrSpr->isVisible) ? 1 : 0))\n"
+              "                    + TJS_N(\" tex=\") + ttstr((tjs_int)((krkrSpr && krkrSpr->texture) ? 1 : 0))\n"
+              "                    + TJS_N(\" win=\") + ttstr((tjs_int)RW) + TJS_N(\"x\") + ttstr((tjs_int)RH));\n"
               "            }\n"
-              "            if (krkrDbgFrame == 150 && !krkrWin->GetVisible())\n"
+              "            if (krkrSpr && !krkrSpr->isVisible && krkrDbgFrame < 600)\n"
               "            {\n"
               "                krkrWin->SetVisible(true);\n"
-              "                TVPAddImportantLog(TJS_N(\"[dbg] window was invisible -> forced visible\"));\n"
+              "                if (krkrDbgFrame == 31)\n"
+              "                    TVPAddImportantLog(ttstr(TJS_N(\"[dbg] sprite was invisible -> forced visible\")));\n"
               "            }\n"
               "            if (krkrDbgFrame == 240 && krkrWin->GetWaitVSync())\n"
               "            {\n"
               "                krkrWin->SetWaitVSync(false);\n"
-              "                TVPAddImportantLog(TJS_N(\"[dbg] waitVSync was on -> turned off\"));\n"
+              "                TVPAddImportantLog(ttstr(TJS_N(\"[dbg] waitVSync was on -> turned off\")));\n"
               "            }\n"
               "        }\n"
               "    }\n"
@@ -512,7 +522,9 @@ jobs:
               print("patched:", p)
           PYEOF
           echo "--- verify ---"
-          grep -n "dbg] frame \|DeliverDrawDeviceShow" src/cpp/environ/sdl3/sdl3_app.cpp | head -6
+          grep -n "krkrsdl3::KRKR_Get_Current_Sprite\|DeliverDrawDeviceShow" src/cpp/environ/sdl3/sdl3_app.cpp | head -6
+          echo "--- verify namespace qualifier present (build error in run#17 was the unqualified call) ---"
+          grep -c "krkrsdl3::KRKR_Get_Current_Sprite" src/cpp/environ/sdl3/sdl3_app.cpp
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
