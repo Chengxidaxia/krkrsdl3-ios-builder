@@ -425,7 +425,6 @@ jobs:
               "            iTJSDispatch2* krkrItem = TJSCreateArrayObject();",
               "            tTJSVariant krkrCV(krkrChildren, krkrChildren);",
               "            krkrItem->PropSet(TJS_MEMBERENSURE, TJS_N(\"children\"), NULL, &krkrCV, krkrItem);",
-              "            krkrCV.Release();",
               "            krkrChildren->Release();",
               "            tTJSVariant krkrIV(krkrItem, krkrItem);",
               "            krkrItem->Release();",
