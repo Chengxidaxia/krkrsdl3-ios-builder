@@ -550,6 +550,10 @@ jobs:
                             '    /* patched: opaque black letterbox (was bright green while we were\n'
                             '       proving that the software path really reaches the screen). */\n'
                             '    SDL_SetRenderDrawColor(tvp_renderer, 0, 0, 0, 255);', "sw-clear")
+              s1 = sub1(s1, 'static SDL_Window* tvp_window;',
+                            'SDL_Window* tvp_window;   /* patched: was static; exported so that the\n'
+                            '                             screen-size queries can report the real window */',
+                        "export-window")
               save(p1, s1, crlf1)
               print("patched:", p1)
 
