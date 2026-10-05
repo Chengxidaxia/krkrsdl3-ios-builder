@@ -461,7 +461,7 @@ jobs:
       - name: Patch iOS frame-loop present + pipeline diagnostics
         run: |
           python3 - <<'PYEOF'
-          import io
+          import io, sys
 
           # ---- 1) environ/sdl3/sdl3_app.cpp --------------------------------
           # 移植缺陷：TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）全工程没有调用者，
@@ -470,8 +470,11 @@ jobs:
           #
           # ★ 本文件在 iOS 上走 _KRKRSDL3_GLES 分支，只 include glad/glad_egl.h，
           #   **没有 GL 核心函数声明**（glClear / glScissor / glBindFramebuffer 等一律
-          #   编译失败 —— 这正是 run#19 挂在 Build 步骤的原因）。所以这一段只做与 GL
-          #   无关的事；需要 GL 的诊断放到 core/render/backend/GLRenderBackend.cpp。
+          #   编译失败 —— run#19 就是挂在这里）。所以这一段只做与 GL 无关的事；
+          #   需要 GL 的诊断放到 core/render/backend/GLRenderBackend.cpp。
+          #
+          # 注意行尾：本文件是 CRLF。锚点是不含换行的单行，所以不受影响；
+          # 多行锚点必须先把 CRLF 归一化（见第 2 段）。
           p = "src/cpp/environ/sdl3/sdl3_app.cpp"
           MARK = "[dbg] frame "
           A = "    krkrsdl3::TVPRenderOnce(RW, RH);"
@@ -514,16 +517,22 @@ jobs:
           if MARK in src:
               print("already patched:", p)
           else:
-              assert src.count(A) == 1, "TVPRenderOnce call count = %d (expect 1)" % src.count(A)
+              if src.count(A) != 1:
+                  i = src.find("TVPRenderOnce")
+                  sys.stderr.write("ANCHOR MISS (%d); context:\n%s\n" % (src.count(A), src[i - 200:i + 200]))
+                  raise SystemExit(1)
               io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D))
               print("patched:", p)
 
           # ---- 2) core/render/backend/GLRenderBackend.cpp -------------------
-          # 着色实验（run#20）：把每帧清屏色从黑改成绿。只改一个常量，不引入任何
-          # 新符号 —— 本文件本来就 include 了 glad。判读：
-          #   屏幕出现绿色(哪怕只是上下两条边) => GL 呈现通路确实到达了屏幕，
-          #                                      黑屏是「内容/视口」问题；
+          # 着色实验（run#20）：把每帧清屏色从黑改成绿。只改一个常量、不引入任何新
+          # 符号（本文件本来就 include 了 glad）。判读：
+          #   屏幕出现绿色(哪怕只是上下两条边，因为窗口纹理 1280x720 会 letterbox
+          #   到 480x270 居中) => GL 呈现通路确实到达屏幕，黑屏是「内容/视口」问题；
           #   仍然全黑                        => 呈现通路坏，下一步切 software 后端。
+          #
+          # ★ 多行锚点必须先归一化行尾：上游 checkout 出来的文件可能是 CRLF，
+          #   而锚点里的 \n 在 CRLF 文件里匹配不到（run#20 之前的隐患）。
           p2 = "src/cpp/core/render/backend/GLRenderBackend.cpp"
           MARK2 = "patched: green clear"
           A2 = ("    glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
@@ -534,20 +543,30 @@ jobs:
                 "       path really reaches the display; still black => it does not. */\n"
                 "    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);\n"
                 "    glDisable(GL_DEPTH_TEST);")
-          src2 = io.open(p2, encoding="utf-8", newline="").read()
-          if MARK2 in src2:
+          raw2 = io.open(p2, "rb").read()
+          crlf2 = b"\r\n" in raw2
+          s2 = raw2.decode("utf-8")
+          if crlf2:
+              s2 = s2.replace("\r\n", "\n")
+          if MARK2 in s2:
               print("already patched:", p2)
           else:
-              assert src2.count(A2) == 1, "clear anchor count = %d (expect 1)" % src2.count(A2)
-              io.open(p2, "w", encoding="utf-8", newline="").write(src2.replace(A2, D2))
-              print("patched:", p2)
+              if s2.count(A2) != 1:
+                  i = s2.find("glClearColor")
+                  sys.stderr.write("ANCHOR MISS (%d) crlf=%s; context:\n%s\n" % (s2.count(A2), crlf2, s2[i - 200:i + 200]))
+                  raise SystemExit(1)
+              s2 = s2.replace(A2, D2)
+              if crlf2:
+                  s2 = s2.replace("\n", "\r\n")
+              io.open(p2, "wb").write(s2.encode("utf-8"))
+              print("patched:", p2, "(crlf=%s)" % crlf2)
           PYEOF
           echo "--- verify: namespace qualifier (run#17 build error) ---"
-          grep -c "krkrsdl3::KRKR_Get_Current_Sprite" src/cpp/environ/sdl3/sdl3_app.cpp
+          grep -c "krkrsdl3::KRKR_Get_Current_Sprite" src/cpp/environ/sdl3/sdl3_app.cpp || true
           echo "--- verify: stale colour-test block removed from sdl3_app.cpp (expect 0) ---"
-          grep -c "colour test" src/cpp/environ/sdl3/sdl3_app.cpp
+          grep -c "colour test" src/cpp/environ/sdl3/sdl3_app.cpp || true
           echo "--- verify: green clear in place ---"
-          grep -n "patched: green clear" -A 2 src/cpp/core/render/backend/GLRenderBackend.cpp
+          grep -n "patched: green clear" -A 2 src/cpp/core/render/backend/GLRenderBackend.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
