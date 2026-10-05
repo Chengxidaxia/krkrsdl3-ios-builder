@@ -462,27 +462,16 @@ jobs:
         run: |
           python3 - <<'PYEOF'
           import io
-          # 两个移植缺陷叠加：
-          #  (a) TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）全工程没有调用者；
-          #  (b) TVPWindow::UpdateContent() 只在 WaitVSync=false 且窗口可见时才 Show()。
-          # 这里每帧补上 (a)，并把管线状态打进 stderr。
+
+          # ---- 1) environ/sdl3/sdl3_app.cpp --------------------------------
+          # 移植缺陷：TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）全工程没有调用者，
+          # 而 TVPWindow::UpdateContent() 只在 WaitVSync=false 且窗口可见时才 Show()。
+          # 这里每帧补上，并把管线状态打进 stderr。
           #
-          # 追加的分屏着色实验（run#19）：r18 日志显示 sprite/texture/窗口可见性全部正常，
-          # 但屏幕仍黑；且 SDL 报告的窗口尺寸只有 480x320（我们请求的是 1280x720），
-          # 于是 GL 视口可能只覆盖真实 drawable 的一角。
-          #   green = 整个 drawable, red = 左下 1/4（scissor）
-          # 看得到 => GL 呈现通路有效且 drawable 尺寸就是打印出来的 winPix；
-          # 看不到 => 呈现通路坏，下一步换 software(SDL/Metal) 后端；
-          # 只看到一小块 => drawable 与窗口尺寸不一致，需要按像素尺寸设视口。
-          #
-          # 符号已逐个核对：
-          #   TVPGetActiveWindow()               core/main/WindowManager.h（全局）
-          #   TVPWindow::DeliverDrawDeviceShow / GetVisible / SetVisible /
-          #   GetWaitVSync / SetWaitVSync        core/main/TVPWindow.h（public）
-          #   krkrsdl3::KRKR_Get_Current_Sprite  core/main/WindowManager.h（★ 注意命名空间）
-          #   TVPSprite 成员 isVisible/texture   environ/PlatformView.h（经 TVPWindow.h 引入）
-          #   TVPAddImportantLog                 core/msg/TVPDebug.h（sdl3_app.cpp 已 include）
-          #   gl* / SDL_GL_SwapWindow / SDL_GetWindowSizeInPixels 均已在 sdl3_app.cpp 可见
+          # ★ 本文件在 iOS 上走 _KRKRSDL3_GLES 分支，只 include glad/glad_egl.h，
+          #   **没有 GL 核心函数声明**（glClear / glScissor / glBindFramebuffer 等一律
+          #   编译失败 —— 这正是 run#19 挂在 Build 步骤的原因）。所以这一段只做与 GL
+          #   无关的事；需要 GL 的诊断放到 core/render/backend/GLRenderBackend.cpp。
           p = "src/cpp/environ/sdl3/sdl3_app.cpp"
           MARK = "[dbg] frame "
           A = "    krkrsdl3::TVPRenderOnce(RW, RH);"
@@ -520,35 +509,6 @@ jobs:
               "        }\n"
               "    }\n"
               + A + "\n"
-              "    /* patched: colour test -- full drawable = green, bottom-left quarter = red.\n"
-              "       Tells us whether the GL present path reaches the screen and how big the\n"
-              "       drawable really is (SDL_GetWindowSizeInPixels). */\n"
-              "    {\n"
-              "        static int krkrColourFrames = 0;\n"
-              "        krkrColourFrames++;\n"
-              "        if (krkrColourFrames == 30)\n"
-              "            TVPAddImportantLog(ttstr(TJS_N(\"[dbg] colour test ON: full=green, bottom-left quarter=red (frames 30..900)\")));\n"
-              "        if (krkrColourFrames >= 30 && krkrColourFrames <= 900)\n"
-              "        {\n"
-              "            int krkrPW = 0, krkrPH = 0;\n"
-              "            SDL_GetWindowSizeInPixels(tvp_window, &krkrPW, &krkrPH);\n"
-              "            glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
-              "            glDisable(GL_SCISSOR_TEST);\n"
-              "            glClearColor(0.0f, 1.0f, 0.0f, 1.0f);\n"
-              "            glClear(GL_COLOR_BUFFER_BIT);\n"
-              "            glEnable(GL_SCISSOR_TEST);\n"
-              "            glScissor(0, 0, krkrPW / 2, krkrPH / 2);\n"
-              "            glClearColor(1.0f, 0.0f, 0.0f, 1.0f);\n"
-              "            glClear(GL_COLOR_BUFFER_BIT);\n"
-              "            glDisable(GL_SCISSOR_TEST);\n"
-              "            SDL_GL_SwapWindow(tvp_window);\n"
-              "            if (krkrColourFrames == 31)\n"
-              "                TVPAddImportantLog(ttstr(TJS_N(\"[dbg] colour test: winPix=\")) + ttstr((tjs_int)krkrPW) + TJS_N(\"x\") + ttstr((tjs_int)krkrPH)\n"
-              "                    + TJS_N(\" err=\") + ttstr((tjs_int)glGetError()));\n"
-              "        }\n"
-              "        if (krkrColourFrames == 901)\n"
-              "            TVPAddImportantLog(ttstr(TJS_N(\"[dbg] colour test OFF\")));\n"
-              "    }\n"
           )
           src = io.open(p, encoding="utf-8", newline="").read()
           if MARK in src:
@@ -557,11 +517,37 @@ jobs:
               assert src.count(A) == 1, "TVPRenderOnce call count = %d (expect 1)" % src.count(A)
               io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D))
               print("patched:", p)
+
+          # ---- 2) core/render/backend/GLRenderBackend.cpp -------------------
+          # 着色实验（run#20）：把每帧清屏色从黑改成绿。只改一个常量，不引入任何
+          # 新符号 —— 本文件本来就 include 了 glad。判读：
+          #   屏幕出现绿色(哪怕只是上下两条边) => GL 呈现通路确实到达了屏幕，
+          #                                      黑屏是「内容/视口」问题；
+          #   仍然全黑                        => 呈现通路坏，下一步切 software 后端。
+          p2 = "src/cpp/core/render/backend/GLRenderBackend.cpp"
+          MARK2 = "patched: green clear"
+          A2 = ("    glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
+                "    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);\n"
+                "    glDisable(GL_DEPTH_TEST);")
+          D2 = ("    glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
+                "    /* patched: green clear (diagnostic). Green on screen => the GL present\n"
+                "       path really reaches the display; still black => it does not. */\n"
+                "    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);\n"
+                "    glDisable(GL_DEPTH_TEST);")
+          src2 = io.open(p2, encoding="utf-8", newline="").read()
+          if MARK2 in src2:
+              print("already patched:", p2)
+          else:
+              assert src2.count(A2) == 1, "clear anchor count = %d (expect 1)" % src2.count(A2)
+              io.open(p2, "w", encoding="utf-8", newline="").write(src2.replace(A2, D2))
+              print("patched:", p2)
           PYEOF
-          echo "--- verify: namespace qualifier present (run#17 build error) ---"
+          echo "--- verify: namespace qualifier (run#17 build error) ---"
           grep -c "krkrsdl3::KRKR_Get_Current_Sprite" src/cpp/environ/sdl3/sdl3_app.cpp
-          echo "--- verify: present + colour test in place ---"
-          grep -n "DeliverDrawDeviceShow\|colour test ON\|glScissor" src/cpp/environ/sdl3/sdl3_app.cpp | head -8
+          echo "--- verify: stale colour-test block removed from sdl3_app.cpp (expect 0) ---"
+          grep -c "colour test" src/cpp/environ/sdl3/sdl3_app.cpp
+          echo "--- verify: green clear in place ---"
+          grep -n "patched: green clear" -A 2 src/cpp/core/render/backend/GLRenderBackend.cpp
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
