@@ -581,6 +581,52 @@ jobs:
               s2 = sub1(s2, A2, D2, "miss-log-removal")
               save(p2, s2, crlf2)
               print("patched:", p2, "crlf=%s" % crlf2)
+
+          # ---- 3) 屏幕尺寸：iOS 上 SDL_GetCurrentDisplayMode 报的是竖屏 ----
+          # 日志实测 System.screenWidth x screenHeight = 375x812（竖屏），而窗口是横屏
+          # 812x375。游戏据此把 UI 按"屏幕高 812"摆放，于是画面下半部分落到 720 的画面
+          # 之外 —— 这就是"底部被截断"。改成优先返回真实窗口尺寸。
+          # 前提：tvp_window 已由上面 export-window 去掉 static（本步骤同一轮里完成）。
+          p3 = "src/cpp/environ/sdl3/sdl3_utils.cpp"
+          MARK3 = "patched: real window size"
+          GW = ("int tTVPScreen::GetWidth()\n"
+                "{\n"
+                "    SDL_DisplayID display = SDL_GetPrimaryDisplay();\n"
+                "    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);\n"
+                "    return mode ? mode->w : 0;\n"
+                "}")
+          GWn = ("int tTVPScreen::GetWidth()\n"
+                 "{\n"
+                 "    /* patched: real window size -- on iOS SDL_GetCurrentDisplayMode()\n"
+                 "       keeps reporting the portrait mode (375x812) although the window\n"
+                 "       is landscape (812x375), which makes the game lay its UI out for\n"
+                 "       a portrait screen and pushes the bottom of the picture outside\n"
+                 "       the visible area. */\n"
+                 "    int krkrW = 0, krkrH = 0;\n"
+                 "    if (tvp_window && SDL_GetWindowSize(tvp_window, &krkrW, &krkrH) && krkrW > 0)\n"
+                 "        return krkrW;\n"
+                 "    SDL_DisplayID display = SDL_GetPrimaryDisplay();\n"
+                 "    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);\n"
+                 "    return mode ? mode->w : 0;\n"
+                 "}")
+          s3, crlf3 = load(p3)
+          if MARK3 in s3:
+              print("already patched:", p3)
+          else:
+              s3 = sub1(s3, 'bool TVP_stat(const char* name, tTVP_stat& s)',
+                            '/* patched: tvp_window is defined in sdl3_app.cpp. */\n'
+                            'extern SDL_Window* tvp_window;\n'
+                            '\n'
+                            'bool TVP_stat(const char* name, tTVP_stat& s)', "extern-window")
+              s3 = sub1(s3, GW, GWn, "get-width")
+              GH = GW.replace('GetWidth', 'GetHeight').replace('mode->w', 'mode->h')
+              GHn = (GWn.replace('GetWidth', 'GetHeight')
+                        .replace('krkrW > 0', 'krkrH > 0')
+                        .replace('return krkrW;', 'return krkrH;')
+                        .replace('mode->w', 'mode->h'))
+              s3 = sub1(s3, GH, GHn, "get-height")
+              save(p3, s3, crlf3)
+              print("patched:", p3, "crlf=%s" % crlf3)
           PYEOF
           echo "--- verify: render option kept ---"
           grep -c "render=software" src/cpp/environ/sdl3/sdl3_app.cpp || true
@@ -590,6 +636,10 @@ jobs:
           grep -c "storage miss: " src/cpp/core/archive/TVPStorage.cpp || true
           echo "--- verify: miss logging removal marker ---"
           grep -n "miss logging removed" src/cpp/core/archive/TVPStorage.cpp || true
+          echo "--- verify: screen size reports the real window ---"
+          grep -n "patched: real window size" src/cpp/environ/sdl3/sdl3_utils.cpp || true
+          echo "--- verify: tvp_window exported ---"
+          grep -n "^SDL_Window\* tvp_window;" src/cpp/environ/sdl3/sdl3_app.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
