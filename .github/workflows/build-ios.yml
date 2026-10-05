@@ -462,19 +462,27 @@ jobs:
         run: |
           python3 - <<'PYEOF'
           import io
-          # 移植缺陷：TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）在全工程没有任何
-          # 调用者，而 TVPWindow::UpdateContent() 只在 WaitVSync 为 false 时调用
-          # DrawDevice->Show()，且只在该窗口可见时才被事件派发。两者叠加 => 窗口可能
-          # 永远不被呈现 => App 在跑却黑屏。这里在每帧回调里补上这一步，并把管线状态
-          # （窗口可见性 / waitVSync / sprite / 贴图 / 窗口尺寸）打进 stderr。
+          # 两个移植缺陷叠加：
+          #  (a) TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）全工程没有调用者；
+          #  (b) TVPWindow::UpdateContent() 只在 WaitVSync=false 且窗口可见时才 Show()。
+          # 这里每帧补上 (a)，并把管线状态打进 stderr。
+          #
+          # 追加的分屏着色实验（run#19）：r18 日志显示 sprite/texture/窗口可见性全部正常，
+          # 但屏幕仍黑；且 SDL 报告的窗口尺寸只有 480x320（我们请求的是 1280x720），
+          # 于是 GL 视口可能只覆盖真实 drawable 的一角。
+          #   green = 整个 drawable, red = 左下 1/4（scissor）
+          # 看得到 => GL 呈现通路有效且 drawable 尺寸就是打印出来的 winPix；
+          # 看不到 => 呈现通路坏，下一步换 software(SDL/Metal) 后端；
+          # 只看到一小块 => drawable 与窗口尺寸不一致，需要按像素尺寸设视口。
           #
           # 符号已逐个核对：
-          #   TVPGetActiveWindow()            core/main/WindowManager.h（全局）
+          #   TVPGetActiveWindow()               core/main/WindowManager.h（全局）
           #   TVPWindow::DeliverDrawDeviceShow / GetVisible / SetVisible /
-          #   GetWaitVSync / SetWaitVSync     core/main/TVPWindow.h（public）
-          #   krkrsdl3::KRKR_Get_Current_Sprite  core/main/WindowManager.h（注意命名空间）
+          #   GetWaitVSync / SetWaitVSync        core/main/TVPWindow.h（public）
+          #   krkrsdl3::KRKR_Get_Current_Sprite  core/main/WindowManager.h（★ 注意命名空间）
           #   TVPSprite 成员 isVisible/texture   environ/PlatformView.h（经 TVPWindow.h 引入）
-          #   TVPAddImportantLog              core/msg/TVPDebug.h（sdl3_app.cpp 已 include）
+          #   TVPAddImportantLog                 core/msg/TVPDebug.h（sdl3_app.cpp 已 include）
+          #   gl* / SDL_GL_SwapWindow / SDL_GetWindowSizeInPixels 均已在 sdl3_app.cpp 可见
           p = "src/cpp/environ/sdl3/sdl3_app.cpp"
           MARK = "[dbg] frame "
           A = "    krkrsdl3::TVPRenderOnce(RW, RH);"
@@ -511,7 +519,36 @@ jobs:
               "            }\n"
               "        }\n"
               "    }\n"
-              + A
+              + A + "\n"
+              "    /* patched: colour test -- full drawable = green, bottom-left quarter = red.\n"
+              "       Tells us whether the GL present path reaches the screen and how big the\n"
+              "       drawable really is (SDL_GetWindowSizeInPixels). */\n"
+              "    {\n"
+              "        static int krkrColourFrames = 0;\n"
+              "        krkrColourFrames++;\n"
+              "        if (krkrColourFrames == 30)\n"
+              "            TVPAddImportantLog(ttstr(TJS_N(\"[dbg] colour test ON: full=green, bottom-left quarter=red (frames 30..900)\")));\n"
+              "        if (krkrColourFrames >= 30 && krkrColourFrames <= 900)\n"
+              "        {\n"
+              "            int krkrPW = 0, krkrPH = 0;\n"
+              "            SDL_GetWindowSizeInPixels(tvp_window, &krkrPW, &krkrPH);\n"
+              "            glBindFramebuffer(GL_FRAMEBUFFER, 0);\n"
+              "            glDisable(GL_SCISSOR_TEST);\n"
+              "            glClearColor(0.0f, 1.0f, 0.0f, 1.0f);\n"
+              "            glClear(GL_COLOR_BUFFER_BIT);\n"
+              "            glEnable(GL_SCISSOR_TEST);\n"
+              "            glScissor(0, 0, krkrPW / 2, krkrPH / 2);\n"
+              "            glClearColor(1.0f, 0.0f, 0.0f, 1.0f);\n"
+              "            glClear(GL_COLOR_BUFFER_BIT);\n"
+              "            glDisable(GL_SCISSOR_TEST);\n"
+              "            SDL_GL_SwapWindow(tvp_window);\n"
+              "            if (krkrColourFrames == 31)\n"
+              "                TVPAddImportantLog(ttstr(TJS_N(\"[dbg] colour test: winPix=\")) + ttstr((tjs_int)krkrPW) + TJS_N(\"x\") + ttstr((tjs_int)krkrPH)\n"
+              "                    + TJS_N(\" err=\") + ttstr((tjs_int)glGetError()));\n"
+              "        }\n"
+              "        if (krkrColourFrames == 901)\n"
+              "            TVPAddImportantLog(ttstr(TJS_N(\"[dbg] colour test OFF\")));\n"
+              "    }\n"
           )
           src = io.open(p, encoding="utf-8", newline="").read()
           if MARK in src:
@@ -521,10 +558,10 @@ jobs:
               io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D))
               print("patched:", p)
           PYEOF
-          echo "--- verify ---"
-          grep -n "krkrsdl3::KRKR_Get_Current_Sprite\|DeliverDrawDeviceShow" src/cpp/environ/sdl3/sdl3_app.cpp | head -6
-          echo "--- verify namespace qualifier present (build error in run#17 was the unqualified call) ---"
+          echo "--- verify: namespace qualifier present (run#17 build error) ---"
           grep -c "krkrsdl3::KRKR_Get_Current_Sprite" src/cpp/environ/sdl3/sdl3_app.cpp
+          echo "--- verify: present + colour test in place ---"
+          grep -n "DeliverDrawDeviceShow\|colour test ON\|glScissor" src/cpp/environ/sdl3/sdl3_app.cpp | head -8
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
