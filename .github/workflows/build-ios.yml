@@ -324,27 +324,36 @@ jobs:
           echo "--- verify ---"
           grep -n -A 3 "storage miss: " src/cpp/core/archive/TVPStorage.cpp | head -6
 
-      - name: Patch iOS tjs2 exception-message logging
+      - name: Patch iOS tjs2 exception logging (message + position + block dump)
         run: |
           python3 - <<'PYEOF'
           import io
-          # tjs2 的 dump（==== An exception occured ====）不含异常消息；
-          # 在 AddTrace 之后、rethrow 之前把消息打进 console（会进 krkr-ios.log），
-          # 这样连被游戏 try/catch 吃掉的异常也能看到消息。
+          # tjs2 的 VM dump 只打代码和寄存器，不打异常消息；这里在 AddTrace 之后、
+          # rethrow 之前把消息 + 位置打进 console（进 krkr-ios.log）。
+          # 遇到 "Not a function" 这类错误时，再把当前脚本块整体反汇编一遍 ——
+          # 加密脚本（main/*.tjs）只以字节码形式在内存里，这是唯一能看到它代码的办法。
           p = "src/cpp/tjs2/tjsInterCodeExec.cpp"
+          MARK = "[dbg] at: "
           A = (
-              "        e.AddTrace(this, (tjs_int)(codesave - CodeArea));\n"
+              "        e.AddTrace(this, (tjs_int)(codesave - CodeArea));" + chr(10) +
               "        throw e;"
           )
-          MARK = "[dbg] script exception: "
-          D = (
-              "        e.AddTrace(this, (tjs_int)(codesave - CodeArea));\n"
-              "        /* patched: the exception message otherwise never reaches the\n"
-              "           log (the VM dump only shows code + registers). */\n"
-              "        Block->GetTJS()->OutputToConsole(\n"
-              "            (TJS_N(\"[dbg] script exception: \") + e.GetMessage()).c_str());\n"
-              "        throw e;"
-          )
+          D = chr(10).join([
+              "        e.AddTrace(this, (tjs_int)(codesave - CodeArea));",
+              "        /* patched: surface the exception message, source position, and",
+              "           (for unknown-callee errors) the disassembly of this script",
+              "           block -- encrypted game scripts only exist as bytecode. */",
+              "        Block->GetTJS()->OutputToConsole(",
+              "            (TJS_N(\"[dbg] script exception: \") + e.GetMessage()).c_str());",
+              "        Block->GetTJS()->OutputToConsole(",
+              "            (TJS_N(\"[dbg] at: \") + GetPositionDescriptionString((tjs_int)(codesave - CodeArea))).c_str());",
+              "        if (TJS_strstr(e.GetMessage().c_str(), TJS_N(\"Not a function\")) != NULL)",
+              "        {",
+              "            Block->GetTJS()->OutputToConsole(TJS_N(\"[dbg] block dump follows\"));",
+              "            Block->Dump();",
+              "        }",
+              "        throw e;",
+          ])
           src = io.open(p, encoding="utf-8", newline="").read()
           if MARK in src:
               print("already patched:", p)
@@ -354,7 +363,7 @@ jobs:
               print("patched:", p, "(2 sites)")
           PYEOF
           echo "--- verify ---"
-          grep -n -B 1 "script exception: " src/cpp/tjs2/tjsInterCodeExec.cpp | head -6
+          grep -n "\[dbg\] at: \|block dump follows" src/cpp/tjs2/tjsInterCodeExec.cpp | head -6
 
       - name: Patch iOS about-string capability probe
         run: |
