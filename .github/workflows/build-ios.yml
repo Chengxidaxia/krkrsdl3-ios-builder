@@ -458,6 +458,61 @@ jobs:
           echo "--- verify ---"
           grep -n -A 2 "substituted missing member" src/cpp/tjs2/tjsInterCodeExec.cpp | head -5
 
+      - name: Patch iOS frame-loop present + pipeline diagnostics
+        run: |
+          python3 - <<'PYEOF'
+          import io
+          # 移植缺陷：TVPWindow::DeliverDrawDeviceShow()（VBlank 呈现）在全工程没有任何
+          # 调用者，而 TVPWindow::UpdateContent() 只在 WaitVSync 为 false 时调用
+          # DrawDevice->Show()。两者叠加 => 窗口可能永远不被呈现 => App 在跑却黑屏。
+          # 这里在每帧回调里补上这一步，并把管线状态（窗口可见性 / waitVSync /
+          # sprite / 贴图 / 窗口尺寸）打进 stderr；同时把可见性与 waitVSync 纠正回来。
+          p = "src/cpp/environ/sdl3/sdl3_app.cpp"
+          MARK = "[dbg] frame "
+          A = "    krkrsdl3::TVPRenderOnce(RW, RH);"
+          D = (
+              "    /* patched: VBlank present step + pipeline diagnostics */\n"
+              "    {\n"
+              "        static int krkrDbgFrame = 0;\n"
+              "        TVPWindow* krkrWin = TVPGetActiveWindow();\n"
+              "        if (krkrWin)\n"
+              "        {\n"
+              "            krkrWin->DeliverDrawDeviceShow();\n"
+              "            krkrDbgFrame++;\n"
+              "            if (krkrDbgFrame == 30 || krkrDbgFrame == 300 || krkrDbgFrame == 1200)\n"
+              "            {\n"
+              "                TVPSprite* krkrSpr = KRKR_Get_Current_Sprite();\n"
+              "                TVPAddImportantLog(ttstr(TJS_N(\"[dbg] frame \")) + ttstr(krkrDbgFrame)\n"
+              "                    + TJS_N(\" winVisible=\") + ttstr((int)(krkrWin->GetVisible() ? 1 : 0))\n"
+              "                    + TJS_N(\" waitVSync=\") + ttstr((int)(krkrWin->GetWaitVSync() ? 1 : 0))\n"
+              "                    + TJS_N(\" sprite=\") + ttstr((int)(krkrSpr ? 1 : 0))\n"
+              "                    + TJS_N(\" tex=\") + ttstr((int)((krkrSpr && krkrSpr->texture) ? 1 : 0))\n"
+              "                    + TJS_N(\" win=\") + ttstr(RW) + TJS_N(\"x\") + ttstr(RH));\n"
+              "            }\n"
+              "            if (krkrDbgFrame == 150 && !krkrWin->GetVisible())\n"
+              "            {\n"
+              "                krkrWin->SetVisible(true);\n"
+              "                TVPAddImportantLog(TJS_N(\"[dbg] window was invisible -> forced visible\"));\n"
+              "            }\n"
+              "            if (krkrDbgFrame == 240 && krkrWin->GetWaitVSync())\n"
+              "            {\n"
+              "                krkrWin->SetWaitVSync(false);\n"
+              "                TVPAddImportantLog(TJS_N(\"[dbg] waitVSync was on -> turned off\"));\n"
+              "            }\n"
+              "        }\n"
+              "    }\n"
+              + A
+          )
+          src = io.open(p, encoding="utf-8", newline="").read()
+          if MARK in src:
+              print("already patched:", p)
+          else:
+              assert src.count(A) == 1, "TVPRenderOnce call count = %d (expect 1)" % src.count(A)
+              io.open(p, "w", encoding="utf-8", newline="").write(src.replace(A, D))
+              print("patched:", p)
+          PYEOF
+          echo "--- verify ---"
+          grep -n "dbg] frame \|DeliverDrawDeviceShow" src/cpp/environ/sdl3/sdl3_app.cpp | head -6
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
