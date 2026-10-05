@@ -492,6 +492,8 @@ jobs:
               "                    + TJS_N(\" winVisible=\") + ttstr((tjs_int)(krkrWin->GetVisible() ? 1 : 0))\n"
               "                    + TJS_N(\" waitVSync=\") + ttstr((tjs_int)(krkrWin->GetWaitVSync() ? 1 : 0))\n"
               "                    + TJS_N(\" sprite=\") + ttstr((tjs_int)(krkrSpr ? 1 : 0))\n"
+              "                    + TJS_N(\" spr=\") + ttstr((tjs_int)(krkrSpr ? krkrSpr->width : -1))\n"
+              "                    + TJS_N(\"x\") + ttstr((tjs_int)(krkrSpr ? krkrSpr->height : -1))\n"
               "                    + TJS_N(\" win=\") + ttstr((tjs_int)RW) + TJS_N(\"x\") + ttstr((tjs_int)RH));\n"
               "            }\n"
               "            if (krkrSpr && !krkrSpr->isVisible && krkrDbgFrame < 600)\n"
