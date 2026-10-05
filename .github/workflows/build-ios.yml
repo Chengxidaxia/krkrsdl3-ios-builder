@@ -554,6 +554,81 @@ jobs:
                             'SDL_Window* tvp_window;   /* patched: was static; exported so that the\n'
                             '                             screen-size queries can report the real window */',
                         "export-window")
+              # ---- ★ r26：SDL_AppInit 幂等化（iOS 上 SDL 会重入一次）----
+              # r25 日志证据：19.97s 出现第二轮 "Exe path / Game path / Specified option"，
+              # 且 Specified option 里 -render=software 出现两次；紧接着
+              #   Failed to create window for renderer software: Only one window allowed per display.
+              #   Window creation failed ... falling back to software.
+              # 后果：窗口被留在 SDL 默认的 480x320(3:2)，而渲染画布是 1280x720(16:9)
+              #   -> letterbox min(480/1280, 320/720)=0.375 -> 480x270
+              #   -> 上下左右全有黑边 + 画面缩到 480 宽再放大 -> 「糊 + 不全」。
+              # 两处根因（都在 core/utils/TVPSettings.cpp）：
+              #   1) TVPParseArguments 从不调用 TVPClearAllArguments()，而
+              #      TVPInitProgramArguments 只 push_back() -> 重入一次参数就累积一份。
+              #   2) 重入时会再走 TVPCreateWindowForBackend()，而此时窗口已存在 -> 创建失败。
+              # 修法：进入 SDL_AppInit 先清空参数表；窗口已存在则复用（跳过重建）。
+              s1 = sub1(s1, '    // 参数解析\n    if (!TVPParseArguments(argc, argv))\n        return SDL_APP_FAILURE;',
+                            '    /* patched (r26): make re-entry idempotent. On iOS (SDL_MAIN_USE_CALLBACKS)\n'
+                            '       SDL_AppInit can be entered a second time; the argument list is\n'
+                            '       only ever appended to, so the second pass would double every\n'
+                            '       option and try to create a second window (which fails with\n'
+                            '       "Only one window allowed per display", leaving the window at\n'
+                            '       SDL\'s default 480x320). Clear the accumulated arguments first. */\n'
+                            '    krkrsdl3::TVPClearAllArguments();\n'
+                            '    // 参数解析\n'
+                            '    if (!TVPParseArguments(argc, argv))\n'
+                            '        return SDL_APP_FAILURE;',
+                        "arg-clear")
+              s1 = sub1(s1, '    // 窗口（按所选后端决定标志位；创建失败时回退软渲染）\n'
+                            '    if (!TVPCreateWindowForBackend(TVPSettings.renderer))\n'
+                            '    {\n'
+                            '        SDL_Log("Window creation failed for renderer %s, falling back to software.",\n'
+                            '                TVPSettings.renderer.c_str());\n'
+                            '        TVPSettings.renderer = "software";\n'
+                            '        if (!TVPCreateWindowForBackend(TVPSettings.renderer))\n'
+                            '            return SDL_APP_FAILURE;\n'
+                            '    }\n'
+                            '    // 渲染后端（失败时回退软渲染）\n'
+                            '    if (!TVPInitRenderBackend())\n'
+                            '    {\n'
+                            '        SDL_Log("Render backend \'%s\' init failed, falling back to software.", TVPSettings.renderer.c_str());\n'
+                            '        krkrsdl3::TVPShutdownRenderBackend();\n'
+                            '        SDL_DestroyWindow(tvp_window);\n'
+                            '        tvp_window = NULL;\n'
+                            '        TVPSettings.renderer = "software";\n'
+                            '        if (!TVPCreateWindowForBackend(TVPSettings.renderer) || !TVPInitRenderBackend())\n'
+                            '            return SDL_APP_FAILURE;',
+                            '    /* patched (r26): on re-entry reuse the existing window AND the existing\n'
+                            '       renderer -- creating either a second time fails on iOS (SDL allows\n'
+                            '       only one window per display) and leaves the window at 480x320. */\n'
+                            '    if (tvp_window && tvp_renderer)\n'
+                            '    {\n'
+                            '        SDL_Log("[patched] iOS re-entry: reusing existing window + renderer");\n'
+                            '    }\n'
+                            '    else\n'
+                            '    {\n'
+                            '    // 窗口（按所选后端决定标志位；创建失败时回退软渲染）\n'
+                            '    if (!TVPCreateWindowForBackend(TVPSettings.renderer))\n'
+                            '    {\n'
+                            '        SDL_Log("Window creation failed for renderer %s, falling back to software.",\n'
+                            '                TVPSettings.renderer.c_str());\n'
+                            '        TVPSettings.renderer = "software";\n'
+                            '        if (!TVPCreateWindowForBackend(TVPSettings.renderer))\n'
+                            '            return SDL_APP_FAILURE;\n'
+                            '    }\n'
+                            '    // 渲染后端（失败时回退软渲染）\n'
+                            '    if (!TVPInitRenderBackend())\n'
+                            '    {\n'
+                            '        SDL_Log("Render backend \'%s\' init failed, falling back to software.", TVPSettings.renderer.c_str());\n'
+                            '        krkrsdl3::TVPShutdownRenderBackend();\n'
+                            '        SDL_DestroyWindow(tvp_window);\n'
+                            '        tvp_window = NULL;\n'
+                            '        TVPSettings.renderer = "software";\n'
+                            '        if (!TVPCreateWindowForBackend(TVPSettings.renderer) || !TVPInitRenderBackend())\n'
+                            '            return SDL_APP_FAILURE;\n'
+                            '    }\n'
+                            '    }   /* end r26 re-entry guard */',
+                        "window-reuse")
               # ---- 最终出口强制 letterbox（r23 实测：上游传来的矩形是"铺满宽度"，上下溢出）----
               OLDFN = (
                   "void TVPRenderTextureBackend(TVPSprite* sp, int posX, int posY, int width, int height)\n"
