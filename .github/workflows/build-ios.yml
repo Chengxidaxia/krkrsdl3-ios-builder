@@ -550,6 +550,13 @@ jobs:
                             '    /* patched: opaque black letterbox (was bright green while we were\n'
                             '       proving that the software path really reaches the screen). */\n'
                             '    SDL_SetRenderDrawColor(tvp_renderer, 0, 0, 0, 255);', "sw-clear")
+              # r28: 真实屏幕尺寸由 UIKit 提供（SDL 在 iOS 上只会报 480x320）
+              s1 = sub1(s1, '#include "TVPDebug.h"',
+                            '#include "TVPDebug.h"\n'
+                            '\n'
+                            '/* patched (r28): implemented in environ/iOS/ios_core.mm via UIKit;\n'
+                            '   SDL reports 480x320 for every screen query on iOS. */\n'
+                            'extern "C" void KrkrGetRealScreenSize(int* outW, int* outH);', "real-screen-decl")
               s1 = sub1(s1, 'static SDL_Window* tvp_window;',
                             'SDL_Window* tvp_window;   /* patched: was static; exported so that the\n'
                             '                             screen-size queries can report the real window */',
@@ -650,37 +657,37 @@ jobs:
                   '            return SDL_APP_FAILURE;\n'
                   '    }\n'
                   '    }   /* end r26 re-entry guard */\n'
-                  '    /* r27: force the window to the real display area (see above). */\n'
+                  '    /* r27/r28: force the window to the REAL screen size.\n'
+                  '       r27 showed `iOS display=480x320 window=480x320 pixels=480x320`: on iOS\n'
+                  '       SDL reports 480x320 for every one of those queries, so comparing the\n'
+                  '       window against the display was always true-equal and the fixup never\n'
+                  '       ran. Ask UIKit instead (KrkrGetRealScreenSize, ios_core.mm). */\n'
                   '    {\n'
-                  '        SDL_Rect krkrUsable;\n'
-                  '        if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &krkrUsable)\n'
-                  '            && krkrUsable.w > 0 && krkrUsable.h > 0)\n'
+                  '        int krkrRealW = 0, krkrRealH = 0;\n'
+                  '        KrkrGetRealScreenSize(&krkrRealW, &krkrRealH);\n'
+                  '        int krkrCurW = 0, krkrCurH = 0;\n'
+                  '        SDL_GetWindowSize(tvp_window, &krkrCurW, &krkrCurH);\n'
+                  '        int krkrPW = 0, krkrPH = 0;\n'
+                  '        SDL_GetWindowSizeInPixels(tvp_window, &krkrPW, &krkrPH);\n'
+                  '        SDL_Log("[patched] iOS real=%dx%d window=%dx%d pixels=%dx%d",\n'
+                  '                krkrRealW, krkrRealH, krkrCurW, krkrCurH, krkrPW, krkrPH);\n'
+                  '        if (krkrRealW > 0 && krkrRealH > 0\n'
+                  '            && (krkrCurW != krkrRealW || krkrCurH != krkrRealH))\n'
                   '        {\n'
-                  '            int krkrCurW = 0, krkrCurH = 0;\n'
-                  '            SDL_GetWindowSize(tvp_window, &krkrCurW, &krkrCurH);\n'
-                  '            int krkrPW = 0, krkrPH = 0;\n'
-                  '            SDL_GetWindowSizeInPixels(tvp_window, &krkrPW, &krkrPH);\n'
-                  '            SDL_Log("[patched] iOS display=%dx%d window=%dx%d pixels=%dx%d",\n'
-                  '                    krkrUsable.w, krkrUsable.h, krkrCurW, krkrCurH, krkrPW, krkrPH);\n'
-                  '            if (krkrCurW != krkrUsable.w || krkrCurH != krkrUsable.h)\n'
-                  '            {\n'
-                  '                SDL_SetWindowFullscreen(tvp_window, true);\n'
-                  '                SDL_SetWindowSize(tvp_window, krkrUsable.w, krkrUsable.h);\n'
-                  '                SDL_SetWindowPosition(tvp_window,\n'
-                  '                                      SDL_WINDOWPOS_CENTERED,\n'
-                  '                                      SDL_WINDOWPOS_CENTERED);\n'
-                  '                /* SDL_SetWindowSize is enough; SDL_SyncWindow is not\n'
-                  '                   needed here and is avoided to keep the patch on\n'
-                  '                   symbols already used elsewhere in this file. */\n'
-                  '                int krkrNW = 0, krkrNH = 0;\n'
-                  '                SDL_GetWindowSize(tvp_window, &krkrNW, &krkrNH);\n'
-                  '                SDL_Log("[patched] iOS window corrected -> %dx%d",\n'
-                  '                        krkrNW, krkrNH);\n'
-                  '            }\n'
+                  '            SDL_SetWindowSize(tvp_window, krkrRealW, krkrRealH);\n'
+                  '            SDL_SetWindowPosition(tvp_window,\n'
+                  '                                  SDL_WINDOWPOS_CENTERED,\n'
+                  '                                  SDL_WINDOWPOS_CENTERED);\n'
+                  '            int krkrNW = 0, krkrNH = 0;\n'
+                  '            SDL_GetWindowSize(tvp_window, &krkrNW, &krkrNH);\n'
+                  '            int krkrNPW = 0, krkrNPH = 0;\n'
+                  '            SDL_GetWindowSizeInPixels(tvp_window, &krkrNPW, &krkrNPH);\n'
+                  '            SDL_Log("[patched] iOS window corrected -> %dx%d pixels=%dx%d",\n'
+                  '                    krkrNW, krkrNH, krkrNPW, krkrNPH);\n'
                   '        }\n'
                   '        else\n'
                   '        {\n'
-                  '            SDL_Log("[patched] iOS display bounds unavailable: %s", SDL_GetError());\n'
+                  '            SDL_Log("[patched] iOS window already matches real size");\n'
                   '        }\n'
                   '    }',
                   "window-reuse")
@@ -822,6 +829,74 @@ jobs:
               s3 = sub1(s3, GH, GHn, "get-height")
               save(p3, s3, crlf3)
               print("patched:", p3, "crlf=%s" % crlf3)
+          # ---- 4) r28: 真实屏幕尺寸（SDL 在 iOS 上报告 480x320，不可用）----
+          # r27 日志铁证：`[patched] iOS display=480x320 window=480x320 pixels=480x320`
+          # —— SDL_GetDisplayUsableBounds / SDL_GetWindowSizeInPixels 在 iOS 上
+          # 三者全是 480x320，所以 r27 的"窗口 != 可用区才校正"判断永远为假，
+          # 一个字节都没改。改从 UIKit 拿真实尺寸：ios_core.mm 里加一个
+          # C 函数 KrkrGetRealScreenSize()。
+          p4 = "src/cpp/environ/iOS/ios_core.mm"
+          MARK4 = "patched: real screen size from UIKit"
+          HOOK4 = (
+              "\n"
+              "/* ===================== patched: real screen size from UIKit =====================\n"
+              "   SDL on iOS reports 480x320 for BOTH the display bounds and the window size\n"
+              "   in pixels (see the r27 log line \"iOS display=480x320 window=480x320\n"
+              "   pixels=480x320\"), so nothing derived from SDL can tell us the real screen.\n"
+              "   UIScreen.mainScreen.nativeBounds is the PHYSICAL pixel size in the device's\n"
+              "   natural (portrait) orientation and is unaffected by the current rotation, so\n"
+              "   swap the axes when the interface is landscape. */\n"
+              "extern \"C\" void KrkrGetRealScreenSize(int* outW, int* outH)\n"
+              "{\n"
+              "    int w = 0, h = 0;\n"
+              "    @autoreleasepool\n"
+              "    {\n"
+              "        UIScreen* sc = [UIScreen mainScreen];\n"
+              "        if (sc)\n"
+              "        {\n"
+              "            CGRect nb = [sc nativeBounds];\n"
+              "            w = (int)(nb.size.width + 0.5);\n"
+              "            h = (int)(nb.size.height + 0.5);\n"
+              "            UIInterfaceOrientation o = UIInterfaceOrientationUnknown;\n"
+              "            if (@available(iOS 13.0, *))\n"
+              "            {\n"
+              "                for (UIScene* s in UIApplication.sharedApplication.connectedScenes)\n"
+              "                {\n"
+              "                    if ([s isKindOfClass:UIWindowScene.class])\n"
+              "                    {\n"
+              "                        o = ((UIWindowScene*)s).interfaceOrientation;\n"
+              "                        break;\n"
+              "                    }\n"
+              "                }\n"
+              "            }\n"
+              "            if (o == UIInterfaceOrientationUnknown)\n"
+              "            {\n"
+              "                for (UIWindow* ww in UIApplication.sharedApplication.windows)\n"
+              "                {\n"
+              "                    if (ww.windowScene)\n"
+              "                    {\n"
+              "                        o = ww.windowScene.interfaceOrientation;\n"
+              "                        break;\n"
+              "                    }\n"
+              "                }\n"
+              "            }\n"
+              "            if (o == UIInterfaceOrientationLandscapeLeft ||\n"
+              "                o == UIInterfaceOrientationLandscapeRight)\n"
+              "            {\n"
+              "                int t = w; w = h; h = t;\n"
+              "            }\n"
+              "        }\n"
+              "    }\n"
+              "    if (outW) *outW = w;\n"
+              "    if (outH) *outH = h;\n"
+              "}\n")
+          s4, crlf4 = load(p4)
+          if MARK4 in s4:
+              print("already patched:", p4)
+          else:
+              assert "TVPSetGameRunningOrientation" in s4, "ios_core.mm content unexpected"
+              save(p4, s4 + HOOK4, crlf4)
+              print("patched:", p4, "crlf=%s" % crlf4)
           PYEOF
           echo "--- verify: render option kept ---"
           grep -c "render=software" src/cpp/environ/sdl3/sdl3_app.cpp || true
@@ -837,6 +912,9 @@ jobs:
           grep -n "^SDL_Window\* tvp_window;" src/cpp/environ/sdl3/sdl3_app.cpp || true
           echo "--- verify: forced letterbox in place ---"
           grep -n "force aspect-correct letterboxing" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: real screen size from UIKit ---"
+          grep -n "KrkrGetRealScreenSize" src/cpp/environ/iOS/ios_core.mm || true
+          grep -n "KrkrGetRealScreenSize" src/cpp/environ/sdl3/sdl3_app.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
