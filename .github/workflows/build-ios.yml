@@ -851,32 +851,143 @@ jobs:
                             '    SDL_GetRenderOutputSize(tvp_renderer, &RW, &RH);\n'
                             '    if (RW <= 0 || RH <= 0)\n'
                             '        SDL_GetWindowSize(tvp_window, &RW, &RH);\n'
-                            '    /* patched (r42): present at PHYSICAL pixel resolution.\n'
-                            '       On iOS the render output space is the window size in POINTS\n'
-                            '       (812x375) while the panel has 1624x750 physical pixels, so the\n'
-                            '       whole scene was rasterised at 812x375 and then stretched 2x by\n'
-                            '       the presentation path with no extra detail anywhere -- that is\n'
-                            '       the other half of the "blurry" complaint (NEAREST texture\n'
-                            '       sampling, fixed in TVPCreateTextureBackend, is the first half).\n'
+                            '    /* r44 REMOVED: SDL_SetRenderLogicalPresentation(physical, LETTERBOX).\n'
                             '\n'
-                            '       SDL_SetRenderLogicalPresentation() separates the coordinate space\n'
-                            '       RenderTexture draws in from the drawable size. Asking for the\n'
-                            '       physical size makes the letterbox/scale math below run in real\n'
-                            '       pixels, so the picture is generated once at full resolution\n'
-                            '       instead of being magnified after the fact.\n'
+                            '       r43 shipped it believing it would make the renderer rasterise at\n'
+                            '       physical resolution. That was wrong, and the device proved it: the\n'
+                            '       picture collapsed into the top-left corner. SDL documents the\n'
+                            '       function as "the renderer will act as if the current render target\n'
+                            '       is always the requested dimensions, SCALING TO THE ACTUAL\n'
+                            '       RESOLUTION as necessary", and explicitly warns that combining it\n'
+                            '       with your own letterboxing produces "double-letterboxing".\n'
                             '\n'
-                            '       SDL_LOGICAL_PRESENTATION_LETTERBOX matches what this engine\n'
-                            '       already does by hand (TVPCalcLetterbox centres a min-scale-fitted\n'
-                            '       rect), so it must not move anything -- it only supplies the\n'
-                            '       pixel grid. Skipped when UIKit is not up yet (krkrIOSRealW == 0,\n'
-                            '       very early frames) to keep the previous behaviour instead of\n'
-                            '       presenting at 0x0. */\n'
-                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
-                            '        SDL_SetRenderLogicalPresentation(tvp_renderer, krkrIOSRealW,\n'
-                            '            krkrIOSRealH, SDL_LOGICAL_PRESENTATION_LETTERBOX);',
+                            '       That is exactly what happened here: TVPCalcLetterbox already\n'
+                            '       min-scale fits and centres the picture, and LogicalPresentation\n'
+                            '       then scales that result again to the real drawable -> two nested\n'
+                            '       fits -> the picture ends up a small block in the top-left.\n'
+                            '\n'
+                            '       It also never raised the real resolution: the device log for r43\n'
+                            '       still reads "render-output=812x375 pixels=812x375", so the drawable\n'
+                            '       stayed at point size no matter what logical size we asked for.\n'
+                            '\n'
+                            '       The correct lever is SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_\n'
+                            '       BOOLEAN at window creation (see the window-reuse patch below),\n'
+                            '       which makes the drawable itself physical-sized. Leave the\n'
+                            '       presentation mode alone: exactly ONE letterbox, the one the engine\n'
+                            '       already performs. */',
                         "iterate-size")
               save(p1, s1, crlf1)
               print("patched:", p1)
+
+              # ---- r44: 高 DPI drawable（画质模糊的**真正**根因）----
+              # r43 试图用 SDL_SetRenderLogicalPresentation 提升分辨率，实测失败：
+              # 设备日志仍是 `render-output=812x375 pixels=812x375`，画面反而缩到左上角。
+              # 正确的开关在**窗口创建**时：SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN
+              # 让 drawable 自身按物理像素分配。没有它，SDL 的 drawable 就是 812x375
+              # （点空间），整幅画面在 812x375 栅格化后再由系统拉伸到 1624x750 物理像素
+              # —— 这才是"糊"的根源（r43 修的 NEAREST 采样只是它的放大器）。
+              # 开启后 SDL_GetRenderOutputSize() 会返回 1624x750，letterbox 与纹理缩放
+              # 自然在物理像素里进行，且**不引入第二层 letterbox**。
+              s1b, crlf1b = load(p1)
+              HPD_ANCHOR = ('    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, '
+                            'TVPSettings.window_height);')
+              HPD_NEW = (
+                  "    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, "
+                  "TVPSettings.window_height);\n"
+                  "    /* patched (r44): request a PHYSICAL-pixel drawable on iOS.\n"
+                  "       Without this the drawable is point-sized (device log r41..r43 all\n"
+                  "       read `window=812x375 pixels=812x375` while the panel is 1624x750),\n"
+                  "       so the whole scene was rasterised at 812x375 and then stretched 2x\n"
+                  "       by the system -- that is what \"blurry\" actually was.\n"
+                  "\n"
+                  "       SDL documents this property as \"true if the window uses a high pixel\n"
+                  "       density buffer if possible\"; on iOS it makes the drawable match the\n"
+                  "       screen's pixel resolution, after which SDL_GetRenderOutputSize()\n"
+                  "       reports 1624x750 and every letterbox/scale computation in the engine\n"
+                  "       happens in real pixels.\n"
+                  "\n"
+                  "       r43 tried to get this by calling SDL_SetRenderLogicalPresentation()\n"
+                  "       instead. That was the wrong lever: it only tells SDL to scale the\n"
+                  "       logical buffer to the actual drawable, so the drawable stayed at\n"
+                  "       812x375 AND its letterbox nested on top of the engine's own one --\n"
+                  "       the picture collapsed into the top-left corner. r44 removes that call.\n"
+                  "       Harmless elsewhere: it is a hint, and a platform that cannot honour it\n"
+                  "       simply ignores it (SDL_GetError reports \"Property not supported\"). */\n"
+                  "#if defined(_KRKRSDL3_IOS)\n"
+                  "    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN,\n"
+                  "                           true);\n"
+                  "#endif")
+              s1b = sub1(s1b, HPD_ANCHOR, HPD_NEW, "high-pixel-density")
+
+              # ---- r44: 触控坐标必须映射到渲染空间，否则点不准 ----
+              # KRKR_Trig_Mouse*(x,y) 期望的是**渲染输出空间**坐标：WindowManager.cpp
+              # 做的是 (x - sprite->xPos) / sprite->scale，而 xPos/scale 由
+              # TVPCalcLetterbox(sp, RW, RH) 算出，RW/RH 取自 SDL_GetRenderOutputSize。
+              # 但 SDL 的 mouse 事件坐标是**窗口空间**（iOS = 点空间 812x375）。
+              # 开启 high pixel density 后两者相差 2 倍 -> 画面正确但点击位置偏一半，
+              # 正是用户报的"触控还在原来位置"。
+              # 这里加一个显式换算：按 window size 与 render output size 的比例映射，
+              # 等价于 SDL 官方的 SDL_ConvertEventToRenderCoordinates()，但不依赖那个
+              # API 的可用性，且对 motion 事件同样适用。
+              s1b = sub1(s1b,
+                         "SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)\n{\n",
+                         "/* patched (r44): window space -> render space mapping for input.\n"
+                         "   SDL mouse events carry WINDOW-space coordinates (points on iOS,\n"
+                         "   812x375), while KRKR_Trig_Mouse*() expects RENDER-space ones:\n"
+                         "   WindowManager.cpp computes (x - sprite->xPos) / sprite->scale and\n"
+                         "   those come from TVPCalcLetterbox(sp, RW, RH) with RW/RH taken from\n"
+                         "   SDL_GetRenderOutputSize(). When high pixel density makes the output\n"
+                         "   1624x750, the two spaces differ by 2x -- the picture is then correct\n"
+                         "   but every tap lands at half its intended position. Scale x/y by\n"
+                         "   output/window before handing them over. Both factors are 1.0 when\n"
+                         "   the spaces already agree, so this is a no-op elsewhere. */\n"
+                         "static void krkrMouseToRender(int inX, int inY, int* outX, int* outY)\n"
+                         "{\n"
+                         "    int krkrWinW = 0, krkrWinH = 0, krkrOutW = 0, krkrOutH = 0;\n"
+                         "    SDL_GetWindowSize(tvp_window, &krkrWinW, &krkrWinH);\n"
+                         "    SDL_GetRenderOutputSize(tvp_renderer, &krkrOutW, &krkrOutH);\n"
+                         "    *outX = inX;\n"
+                         "    *outY = inY;\n"
+                         "    if (krkrWinW > 0 && krkrWinH > 0 && krkrOutW > 0 && krkrOutH > 0)\n"
+                         "    {\n"
+                         "        *outX = (int)((long long)inX * krkrOutW / krkrWinW);\n"
+                         "        *outY = (int)((long long)inY * krkrOutH / krkrWinH);\n"
+                         "    }\n"
+                         "}\n"
+                         "SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)\n{\n",
+                         "input-coord-helper")
+
+              # 三个使用点统一改写
+              s1b = sub1(s1b,
+                         "                krkrsdl3::KRKR_Trig_MouseDown(tmp, event->button.x, event->button.y);",
+                         "                int krkrMX = 0, krkrMY = 0;   /* patched (r44): window->render space */\n"
+                         "                krkrMouseToRender(event->button.x, event->button.y, &krkrMX, &krkrMY);\n"
+                         "                krkrsdl3::KRKR_Trig_MouseDown(tmp, krkrMX, krkrMY);",
+                         "mouse-down-coord")
+              s1b = sub1(s1b,
+                         "                krkrsdl3::KRKR_Trig_MouseUp(tmp, event->button.x, event->button.y);",
+                         "                int krkrMX = 0, krkrMY = 0;   /* patched (r44): window->render space */\n"
+                         "                krkrMouseToRender(event->button.x, event->button.y, &krkrMX, &krkrMY);\n"
+                         "                krkrsdl3::KRKR_Trig_MouseUp(tmp, krkrMX, krkrMY);",
+                         "mouse-up-coord")
+              s1b = sub1(s1b,
+                         "            krkrsdl3::KRKR_Trig_MouseMove(event->motion.x, event->motion.y);",
+                         "            /* patched (r44): window->render space, same mapping as the buttons */\n"
+                         "            int krkrMX = 0, krkrMY = 0;\n"
+                         "            krkrMouseToRender(event->motion.x, event->motion.y, &krkrMX, &krkrMY);\n"
+                         "            krkrsdl3::KRKR_Trig_MouseMove(krkrMX, krkrMY);",
+                         "mouse-motion-coord")
+
+              # 诊断：把三组空间一次性打出来，下次装机不用再猜
+              s1b = sub1(s1b,
+                         "        SDL_Log(\"[patched] iOS screen=%dx%d (physical)  render-output=%dx%d  window=%dx%d pixels=%dx%d\",",
+                         "        /* patched (r44): also report the pixel density actually granted, so a\n"
+                         "           wrong tap offset can be diagnosed from the log alone: if\n"
+                         "           pixels still equals window, high pixel density was refused. */\n"
+                         "        SDL_Log(\"[patched] iOS screen=%dx%d (physical)  render-output=%dx%d  window=%dx%d pixels=%dx%d\",",
+                         "diag-density")
+              save(p1, s1b, crlf1b)
+              print("patched:", p1, "(high pixel density + input coords)")
 
           # ---- TVPStorage.cpp：关掉 storage-miss 日志（性能）----
           p2 = "src/cpp/core/archive/TVPStorage.cpp"
@@ -1117,8 +1228,12 @@ jobs:
           grep -c "_KRKRSDL3_MACOS) || defined(_KRKRSDL3_IOS)" src/cpp/environ/sdl3/sdl3_app.cpp || true
           echo "--- verify: r42 linear texture filtering (the sharpness fix) ---"
           grep -n "SDL_SCALEMODE_LINEAR" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          echo "--- verify: r42 physical-pixel presentation ---"
-          grep -n "SDL_SetRenderLogicalPresentation" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: r44 SDL_SetRenderLogicalPresentation REMOVED (it double-letterboxed) ---"
+          grep -c "SDL_SetRenderLogicalPresentation(tvp_renderer" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: r44 high pixel density requested on iOS ---"
+          grep -n "SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: r44 input coords mapped window->render space ---"
+          grep -n "krkrMouseToRender" src/cpp/environ/sdl3/sdl3_app.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
