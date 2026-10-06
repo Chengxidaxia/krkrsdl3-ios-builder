@@ -693,12 +693,18 @@ jobs:
                   '        if (krkrRealW > 0 && krkrRealH > 0)\n'
                   '        {\n'
                   '            /* SDL_SetWindowSize is ignored on iOS (see above); only record the\n'
-                  '               value -- sdl3_utils.cpp / the frame loop read krkrIOSRealSize. */\n'
+                  '               value -- it is a DIAGNOSTIC (physical screen), not a render size.\n'
+                  '               r30: the render pipeline uses SDL_GetRenderOutputSize() instead,\n'
+                  '               because SDL_RenderTexture draws in that space, not in physical\n'
+                  '               pixels. Log both so the difference is visible at a glance. */\n'
                   '            krkrIOSRealW = krkrRealW;\n'
                   '            krkrIOSRealH = krkrRealH;\n'
-                  '            SDL_Log("[patched] iOS render size pinned to %dx%d "\n'
-                  '                    "(SDL window stays %dx%d; it is owned by the UIKit view)",\n'
-                  '                    krkrIOSRealW, krkrIOSRealH, krkrCurW, krkrCurH);\n'
+                  '            int krkrOutW = 0, krkrOutH = 0;\n'
+                  '            SDL_GetRenderOutputSize(tvp_renderer, &krkrOutW, &krkrOutH);\n'
+                  '            SDL_Log("[patched] iOS screen=%dx%d (physical)  render-output=%dx%d  '
+                  'window=%dx%d pixels=%dx%d",\n'
+                  '                    krkrRealW, krkrRealH, krkrOutW, krkrOutH, krkrCurW, krkrCurH,\n'
+                  '                    krkrPW, krkrPH);\n'
                   '        }\n'
                   '        else\n'
                   '        {\n'
@@ -730,16 +736,18 @@ jobs:
                   "    if (sp && sp->width > 0 && sp->height > 0)\n"
                   "    {\n"
                   "        int krkrRW = 0, krkrRH = 0;\n"
-                  "        /* r29: SDL reports 480x320 here; prefer the UIKit-measured size. */\n"
-                  "        if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n"
-                  "        {\n"
-                  "            krkrRW = krkrIOSRealW;\n"
-                  "            krkrRH = krkrIOSRealH;\n"
-                  "        }\n"
-                  "        else\n"
-                  "        {\n"
+                  "        /* r30: use the RENDERER's output size, not the physical screen size.\n"
+                  "           r29 fed the UIKit-measured 1624x750 (physical pixels) into this math\n"
+                  "           and the picture came out with a black bar on the LEFT and the right\n"
+                  "           half off-screen.  Reason: SDL_RenderTexture takes coordinates in the\n"
+                  "           renderer's own output space, and on this device that is 812x375\n"
+                  "           (points), not 1624x750.  Drawing at x=[145,1478] inside an 812-wide\n"
+                  "           space leaves 145px black on the left and clips everything beyond\n"
+                  "           812.  SDL_GetRenderOutputSize() reports the space we actually draw\n"
+                  "           in, whatever it is -- self-correcting, no platform guesswork. */\n"
+                  "        SDL_GetRenderOutputSize(tvp_renderer, &krkrRW, &krkrRH);\n"
+                  "        if (krkrRW <= 0 || krkrRH <= 0)\n"
                   "            SDL_GetWindowSize(tvp_window, &krkrRW, &krkrRH);\n"
-                  "        }\n"
                   "        if (krkrRW > 0 && krkrRH > 0)\n"
                   "        {\n"
                   "            float krkrS = (float)krkrRW / (float)sp->width;\n"
@@ -753,7 +761,7 @@ jobs:
                   "            if (!krkrLogged)\n"
                   "            {\n"
                   "                krkrLogged = 1;\n"
-                  "                SDL_Log(\"[dbg] texrect in=(%d,%d,%d,%d) out=(%d,%d,%d,%d) tex=%dx%d win=%dx%d\",\n"
+                  "                SDL_Log(\"[dbg] texrect in=(%d,%d,%d,%d) out=(%d,%d,%d,%d) tex=%dx%d outspace=%dx%d\",\n"
                   "                    posX, posY, width, height, krkrNX, krkrNY, krkrNW, krkrNH,\n"
                   "                    sp->width, sp->height, krkrRW, krkrRH);\n"
                   "            }\n"
@@ -774,43 +782,26 @@ jobs:
               s1 = sub1(s1, OLDFN, NEWFN, "texrect")
               s1 = sub1(s1, 'void TVPGetWindowSize(int* w, int* h)\n{\n    SDL_GetWindowSize(tvp_window, w, h);\n}',
                             'void TVPGetWindowSize(int* w, int* h)\n{\n'
-                            '    /* patched (r29): on iOS SDL only ever reports 480x320 -- the window is\n'
-                            '       fullscreen and its size belongs to the UIKit view.  Prefer the value\n'
-                            '       measured from UIKit so the compositor letterboxes against the real\n'
-                            '       screen instead of a 480x320 canvas that is then upscaled (blur). */\n'
-                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
-                            '    {\n'
-                            '        if (w) *w = krkrIOSRealW;\n'
-                            '        if (h) *h = krkrIOSRealH;\n'
-                            '        return;\n'
-                            '    }\n'
+                            '    /* r30: leave this in SDL\'s own (point) space.  r29 replaced it with the\n'
+                            '       UIKit physical-pixel size and that broke the picture: SDL_RenderTexture\n'
+                            '       and SDL_GetWindowSize share one coordinate space, so mixing in\n'
+                            '       1624x750 while the renderer draws in 812x375 shifted the picture right\n'
+                            '       and clipped it.  See the r30 note in TVPRenderTextureBackend. */\n'
                             '    SDL_GetWindowSize(tvp_window, w, h);\n}',
                         "get-window-size")
               s1 = sub1(s1, 'void TVPGetWindowSizeInPixels(int* w, int* h)\n{\n    SDL_GetWindowSizeInPixels(tvp_window, w, h);\n}',
                             'void TVPGetWindowSizeInPixels(int* w, int* h)\n{\n'
-                            '    /* patched (r29): see TVPGetWindowSize. */\n'
-                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
-                            '    {\n'
-                            '        if (w) *w = krkrIOSRealW;\n'
-                            '        if (h) *h = krkrIOSRealH;\n'
-                            '        return;\n'
-                            '    }\n'
+                            '    /* r30: see TVPGetWindowSize -- keep SDL\'s own space. */\n'
                             '    SDL_GetWindowSizeInPixels(tvp_window, w, h);\n}',
                         "get-window-size-px")
               s1 = sub1(s1, '    int RW = 1280, RH = 720;\n    SDL_GetWindowSize(tvp_window, &RW, &RH);',
                             '    int RW = 1280, RH = 720;\n'
-                            '    /* patched (r29): use the UIKit-measured size when we have it; SDL would\n'
-                            '       hand us its own 480x320 fallback and the 1280x720 canvas would be\n'
-                            '       squeezed into a 480x270 letterbox. */\n'
-                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
-                            '    {\n'
-                            '        RW = krkrIOSRealW;\n'
-                            '        RH = krkrIOSRealH;\n'
-                            '    }\n'
-                            '    else\n'
-                            '    {\n'
-                            '        SDL_GetWindowSize(tvp_window, &RW, &RH);\n'
-                            '    }',
+                            '    /* r30: the frame loop must pass the space the renderer draws in.\n'
+                            '       r29 passed the UIKit physical size (1624x750) and the letterbox came\n'
+                            '       out shifted/clipped; SDL_GetRenderOutputSize() is that space. */\n'
+                            '    SDL_GetRenderOutputSize(tvp_renderer, &RW, &RH);\n'
+                            '    if (RW <= 0 || RH <= 0)\n'
+                            '        SDL_GetWindowSize(tvp_window, &RW, &RH);',
                         "iterate-size")
               save(p1, s1, crlf1)
               print("patched:", p1)
@@ -871,11 +862,11 @@ jobs:
                  "       cover-fit and crop the top/bottom of its 16:9 content. Input is\n"
                  "       unaffected: KRKR_Trig_MouseDown maps window pixels back to the\n"
                  "       1280x720 sprite via (x - xPos) / scale.\n"
-                 "       r29: report the REAL screen size when UIKit knows it (grown by the\n"
-                 "       missing UILaunchScreen fix) so the game lays out against the actual\n"
-                 "       device rather than a guess; fall back to the 1280x720 design\n"
-                 "       resolution only when UIKit has nothing to say. */\n"
-                 "    if (krkrIOSRealW > 0) return krkrIOSRealW;\n"
+                 "       r30: deliberately back to the design resolution.  r29 reported the\n"
+                 "       UIKit physical size (1624x750) here; the game's own primary layer\n"
+                 "       stayed 1280x720 either way (see SIZE layer in the log), so the change\n"
+                 "       bought nothing and only added a second, disagreeing notion of the\n"
+                 "       screen. Keep one number: the game canvas. */\n"
                  "    return 1280;\n"
                  "}")
           s3, crlf3 = load(p3)
@@ -883,10 +874,8 @@ jobs:
               print("already patched:", p3)
           else:
               s3 = sub1(s3, 'bool TVP_stat(const char* name, tTVP_stat& s)',
-                            '/* patched: tvp_window / krkrIOSReal* are defined in sdl3_app.cpp. */\n'
+                            '/* patched: tvp_window is defined in sdl3_app.cpp. */\n'
                             'extern SDL_Window* tvp_window;\n'
-                            'extern int krkrIOSRealW;\n'
-                            'extern int krkrIOSRealH;\n'
                             '\n'
                             'bool TVP_stat(const char* name, tTVP_stat& s)', "extern-window")
               s3 = sub1(s3, GW, GWn, "get-width")
@@ -898,9 +887,7 @@ jobs:
                     "}")
               GHn = ("int tTVPScreen::GetHeight()\n"
                      "{\n"
-                     "    /* patched: native design resolution (height, see GetWidth).\n"
-                     "       r29: real screen size from UIKit when available. */\n"
-                     "    if (krkrIOSRealH > 0) return krkrIOSRealH;\n"
+                     "    /* patched: native design resolution (height, see GetWidth). */\n"
                      "    return 720;\n"
                      "}")
               s3 = sub1(s3, GH, GHn, "get-height")
@@ -1027,10 +1014,12 @@ jobs:
           echo "--- verify: real screen size from UIKit ---"
           grep -n "KrkrGetRealScreenSize" src/cpp/environ/iOS/ios_core.mm || true
           grep -n "KrkrGetRealScreenSize" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          echo "--- verify: r29 real-size globals + consumers ---"
+          echo "--- verify: r29/r30 real-size globals + diagnostics ---"
           grep -n "^int krkrIOSRealW = 0;" src/cpp/environ/sdl3/sdl3_app.cpp || true
           grep -n "krkrIOSRealW" src/cpp/environ/sdl3/sdl3_app.cpp || true
-          grep -n "extern int krkrIOSRealW;" src/cpp/environ/sdl3/sdl3_utils.cpp || true
+          echo "--- verify: r30 render math uses the RENDERER output space ---"
+          grep -n "SDL_GetRenderOutputSize" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          grep -c "krkrIOSRealW" src/cpp/environ/sdl3/sdl3_utils.cpp || true
           echo "--- verify: SDL_SetWindowSize no longer called (it is ignored on iOS) ---"
           grep -c "SDL_SetWindowSize(tvp_window, krkrRealW" src/cpp/environ/sdl3/sdl3_app.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
