@@ -780,6 +780,55 @@ jobs:
                   "    SDL_RenderTexture(tvp_renderer, (SDL_Texture*)sp->texture, NULL, &rectBuff);\n"
                   "}")
               s1 = sub1(s1, OLDFN, NEWFN, "texrect")
+              # ================= r42 =================
+              # ---- (1) 输入：iOS 完全没有 MOUSE 事件处理 ----
+              # 点击无效的根因，用源码钉死（不是猜的）：
+              #   a) SDL 的 iOS 后端（SDL_uikitviewcontroller.m，770 行）里**没有任何**
+              #      触摸/点击代码：touchesBegan / SDL_SendTouch / SDL_AddTouch 全部为 0 处。
+              #      唯一投递输入的是 SDL_uikitevents.m 的手柄路径 SDL_SendMouseButton()。
+              #      也就是说 iOS 上来的是 **MOUSE 事件**，不是 FINGER 事件。
+              #   b) 而 sdl3_app.cpp 的 SDL_AppEvent 把 MOUSE 分支关在
+              #        #if defined(_KRKRSDL3_WINDOWS) || _LINUX || _EMSCRIPTEN || _MACOS
+              #      里，_KRKRSDL3_IOS 不在其中 -> switch 落到 default: break，
+              #      事件被**静默丢弃**。这就是"点了没反应"。
+              #   c) FINGER 分支虽然含 _KRKRSDL3_IOS，但按 (a) 根本不会有 FINGER 事件，
+              #      所以那条路是死的。
+              # 修法：把 iOS 加进 MOUSE 的 #if。这样 SDL 合成出来的 mouse down/up/move
+              # 才会真正进到 KRKR_Trig_Mouse*。
+              MOUSE_OLD = (
+                  "#if defined(_KRKRSDL3_WINDOWS) || defined(_KRKRSDL3_LINUX) "
+                  "|| defined(_KRKRSDL3_EMSCRIPTEN)  || defined(_KRKRSDL3_MACOS)\n"
+                  "        // 鼠标事件\n")
+              MOUSE_NEW = (
+                  "/* patched (r42): _KRKRSDL3_IOS added to the mouse-event platform list.\n"
+                  "       SDL's iOS backend (SDL_uikitviewcontroller.m) contains NO touch\n"
+                  "       handling at all -- zero occurrences of touchesBegan / SDL_SendTouch /\n"
+                  "       SDL_AddTouch -- so iOS delivers MOUSE events (synthesised in\n"
+                  "       SDL_uikitevents.m), never FINGER events. With iOS missing from this\n"
+                  "       #if those events fell through to `default: break` and were dropped,\n"
+                  "       which is exactly the reported \"cannot tap anything\" symptom.\n"
+                  "       Note the FINGER branch below does list _KRKRSDL3_IOS, but it is\n"
+                  "       dead code on iOS for the same reason. */\n"
+                  "#if defined(_KRKRSDL3_WINDOWS) || defined(_KRKRSDL3_LINUX) "
+                  "|| defined(_KRKRSDL3_EMSCRIPTEN)  || defined(_KRKRSDL3_MACOS) "
+                  "|| defined(_KRKRSDL3_IOS)\n"
+                  "        // 鼠标事件\n")
+              s1 = sub1(s1, MOUSE_OLD, MOUSE_NEW, "mouse-platform-if")
+              # ---- (2) 画质：SDL 纹理默认 NEAREST 采样 ----
+              # TVPCreateTextureBackend 建纹理时没有设置 scale mode，SDL 默认
+              # SDL_SCALEMODE_NEAREST。这条 1280x720 的画布要缩到 812x375 再由 Metal
+              # 放大到 1624x750 物理像素，整条链上没有任何双线性过滤 -> 抽帧感/锯齿/"糊"。
+              # 改成 SDL_SCALEMODE_LINEAR 是一行改动、零风险，且对全平台都成立。
+              s1 = sub1(s1,
+                        "    SDL_SetTextureBlendMode((SDL_Texture*)sp.texture, customBlendMode);",
+                        "    SDL_SetTextureBlendMode((SDL_Texture*)sp.texture, customBlendMode);\n"
+                        "    /* patched (r42): linear filtering. Without this the texture keeps\n"
+                        "       SDL's default SDL_SCALEMODE_NEAREST, and since the 1280x720\n"
+                        "       canvas is min-scale fitted into the render output and then\n"
+                        "       upscaled by the presentation layer, every downscale/upscale step\n"
+                        "       point-samples -> jagged, aliased, \"blurry\" picture. */\n"
+                        "    SDL_SetTextureScaleMode((SDL_Texture*)sp.texture, SDL_SCALEMODE_LINEAR);",
+                        "texture-scale-mode")
               s1 = sub1(s1, 'void TVPGetWindowSize(int* w, int* h)\n{\n    SDL_GetWindowSize(tvp_window, w, h);\n}',
                             'void TVPGetWindowSize(int* w, int* h)\n{\n'
                             '    /* r30: leave this in SDL\'s own (point) space.  r29 replaced it with the\n'
@@ -801,7 +850,30 @@ jobs:
                             '       out shifted/clipped; SDL_GetRenderOutputSize() is that space. */\n'
                             '    SDL_GetRenderOutputSize(tvp_renderer, &RW, &RH);\n'
                             '    if (RW <= 0 || RH <= 0)\n'
-                            '        SDL_GetWindowSize(tvp_window, &RW, &RH);',
+                            '        SDL_GetWindowSize(tvp_window, &RW, &RH);\n'
+                            '    /* patched (r42): present at PHYSICAL pixel resolution.\n'
+                            '       On iOS the render output space is the window size in POINTS\n'
+                            '       (812x375) while the panel has 1624x750 physical pixels, so the\n'
+                            '       whole scene was rasterised at 812x375 and then stretched 2x by\n'
+                            '       the presentation path with no extra detail anywhere -- that is\n'
+                            '       the other half of the "blurry" complaint (NEAREST texture\n'
+                            '       sampling, fixed in TVPCreateTextureBackend, is the first half).\n'
+                            '\n'
+                            '       SDL_SetRenderLogicalPresentation() separates the coordinate space\n'
+                            '       RenderTexture draws in from the drawable size. Asking for the\n'
+                            '       physical size makes the letterbox/scale math below run in real\n'
+                            '       pixels, so the picture is generated once at full resolution\n'
+                            '       instead of being magnified after the fact.\n'
+                            '\n'
+                            '       SDL_LOGICAL_PRESENTATION_LETTERBOX matches what this engine\n'
+                            '       already does by hand (TVPCalcLetterbox centres a min-scale-fitted\n'
+                            '       rect), so it must not move anything -- it only supplies the\n'
+                            '       pixel grid. Skipped when UIKit is not up yet (krkrIOSRealW == 0,\n'
+                            '       very early frames) to keep the previous behaviour instead of\n'
+                            '       presenting at 0x0. */\n'
+                            '    if (krkrIOSRealW > 0 && krkrIOSRealH > 0)\n'
+                            '        SDL_SetRenderLogicalPresentation(tvp_renderer, krkrIOSRealW,\n'
+                            '            krkrIOSRealH, SDL_LOGICAL_PRESENTATION_LETTERBOX);',
                         "iterate-size")
               save(p1, s1, crlf1)
               print("patched:", p1)
@@ -1040,6 +1112,13 @@ jobs:
           grep -c "krkrIOSRealW" src/cpp/environ/sdl3/sdl3_utils.cpp || true
           echo "--- verify: SDL_SetWindowSize no longer called (it is ignored on iOS) ---"
           grep -c "SDL_SetWindowSize(tvp_window, krkrRealW" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: r42 iOS handles MOUSE events (the tap fix) ---"
+          grep -n "patched (r42): _KRKRSDL3_IOS added to the mouse-event platform list" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          grep -c "_KRKRSDL3_MACOS) || defined(_KRKRSDL3_IOS)" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: r42 linear texture filtering (the sharpness fix) ---"
+          grep -n "SDL_SCALEMODE_LINEAR" src/cpp/environ/sdl3/sdl3_app.cpp || true
+          echo "--- verify: r42 physical-pixel presentation ---"
+          grep -n "SDL_SetRenderLogicalPresentation" src/cpp/environ/sdl3/sdl3_app.cpp || true
       - name: Patch iOS crash capture (log + uncaught exception -> Documents)
         run: |
           python3 - <<'PYEOF'
