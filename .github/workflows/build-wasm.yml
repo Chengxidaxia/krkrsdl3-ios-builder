@@ -55,6 +55,28 @@ jobs:
           echo "--- vcpkg.json builtin-baseline ---"
           grep -n '"builtin-baseline"' src/vcpkg.json || echo "(no builtin-baseline)"
 
+      # ---- 关键 CI 本地修补：让 Emscripten 分支真的被选中 ----
+      #
+      # 上游 CMakeLists.txt 的判定顺序是
+      #     if(ANDROID) ... elseif(LINUX) ... elseif(EMSCRIPTEN) ...
+      # LINUX 排在 EMSCRIPTEN 前面，而 Emscripten preset 并没有把 LINUX 关掉。
+      # 在 ubuntu runner 上 LINUX 是真，于是走进 LINUX 分支：
+      #     set(VCPKG_TARGET_TRIPLET "x64-linux-release")
+      # vcpkg 就按 **宿主机 x64-linux** 解析依赖（run#2 的日志里赫然列出
+      # ffmpeg/dbus/wayland/x11 这些只在 Linux 上的包，而且 vcpkg.json 里
+      # ffmpeg 明明写了 "platform": "!emscripten"，就是因为平台没被识别成
+      # emscripten 才没被排除），然后去编译 ffmpeg 的宿主工具并失败。
+      #
+      # macOS runner 上跑 iOS 不会碰到这个，因为那时 LINUX 不是真。
+      # 只改这一处，别的都不动：
+      - name: Pin vcpkg triplet to wasm32-emscripten (upstream branch-order workaround)
+        run: |
+          set -e
+          grep -n 'elseif(LINUX)' src/CMakeLists.txt
+          sed -i 's/^elseif(LINUX)/elseif(LINUX AND NOT EMSCRIPTEN)/' src/CMakeLists.txt
+          echo '--- after ---'
+          sed -n '7,30p' src/CMakeLists.txt
+
       - name: Install host tools
         run: |
           sudo apt-get update
@@ -93,7 +115,18 @@ jobs:
           cmake --preset "Emscripten Config" \
             -DUSE_FFMPEG=OFF -DUSE_RENDER_VK=OFF \
             -DCMAKE_C_COMPILER=emcc -DCMAKE_CXX_COMPILER=em++ \
-            -DCMAKE_MAKE_PROGRAM="$(command -v ninja)"
+            -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
+            -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake"
+
+      - name: Show resolved configuration
+        working-directory: src
+        run: |
+          echo "--- CMakeCache: 平台与 triplet ---"
+          grep -E '^(CMAKE_TOOLCHAIN_FILE|CMAKE_SYSTEM_NAME|VCPKG_TARGET_TRIPLET|EMSCRIPTEN|LINUX):' \
+            out/emscripten/CMakeCache.txt || true
+          echo "--- vcpkg 已装的包（应当看不到 ffmpeg / dbus / wayland / x11）---"
+          ls out/emscripten/vcpkg_installed 2>/dev/null || true
+          find out/emscripten/vcpkg_installed -maxdepth 2 -name 'CONTROL' 2>/dev/null | head -40 || true
 
       - name: Build (Release)
         working-directory: src
