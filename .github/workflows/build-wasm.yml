@@ -108,6 +108,26 @@ jobs:
           git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
           "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
 
+      # ---- r38 对照实验：把引擎报告的屏幕尺寸强行改成 1920x1080 ----
+      #
+      # iOS 上（打了 r32 补丁）System.screenWidth/Height = 1920x1080，画面被裁成
+      # 左上角；wasm 上原版引擎报 800x600，同一份数据画面是**完整**的。
+      # 两个环境 kag.sc / kag.px / layer 完全相同，唯一差的就是这个值，
+      # 而 1920x1080 恰好等于游戏自己的布局尺寸 -> KAG 的适配缩放出 1.0
+      # （"屏幕正好装得下"）-> 不缩放 -> 1920x1080 直接画进 1280x720 画布。
+      #
+      # 这里把 wasm 也改成 1920x1080：
+      #   画面跟着变裁 -> 假设成立 -> iOS 侧把 GetWidth/Height 报成画布 1280x720
+      #   画面不变     -> 假设错误，还得继续找
+      - name: "Probe: force screen size to the 1920x1080 layout size"
+        run: |
+          F=src/cpp/environ/sdl3/sdl3_utils.cpp
+          sed -i 's/return mode ? mode->w : 0;/return 1920;/' "$F"
+          sed -i 's/return mode ? mode->h : 0;/return 1080;/' "$F"
+          echo '--- after ---'
+          grep -n -A 6 'int tTVPScreen::GetWidth' "$F"
+          grep -n -A 6 'int tTVPScreen::GetHeight' "$F"
+
       - name: Configure
         working-directory: src
         run: |
