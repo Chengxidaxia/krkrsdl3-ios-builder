@@ -1,6 +1,6 @@
 name: Build krkrsdl3 Emscripten (wasm)
 
-# 目的：把 krkrsdl3 **原样**编译成 WebAssembly，用来判定「画面被居中放大约 1.5 倍」
+# 目的：把 krkrsdl3 **原样**编译成 WebAssembly，用来判定「画面被居中放大/裁切」
 # 到底是**引擎问题**还是 **iOS 平台问题**。
 #
 #   wasm 版也裁  ->  引擎问题（与平台无关）-> 可以在 PC 上迭代，不必反复装机
@@ -10,7 +10,14 @@ name: Build krkrsdl3 Emscripten (wasm)
 # 这里要的就是上游行为。构建脚本与参数完全照抄上游 script/build-emscripten.bat：
 #   cmake --preset "Emscripten Config" -DUSE_FFMPEG=OFF -DUSE_RENDER_VK=OFF
 #   cmake --build --preset "Emscripten Release Build"
-# 唯一差异：上游 preset 写死了 Windows 的 emcc.bat，在 Linux runner 上用命令行 -D 覆盖成 emcc。
+#
+# 与上游 .bat 的差异（都是为了在 Linux runner 上跑通）：
+#   1. preset 写死了 Windows 的 emcc.bat / em++.bat -> 用 -D 覆盖成 emcc / em++。
+#   2. **vcpkg 必须完整 clone**：vcpkg.json 里的 builtin-baseline 是一个具体
+#      commit，`--depth 1` 的浅克隆里没有那个对象，vcpkg 会在
+#      `git show <baseline>:versions/baseline.json` 上直接失败（run#1 就是这么挂的）。
+#   3. 显式指定 CMAKE_MAKE_PROGRAM 指向 ninja，避免 preset 的
+#      "Ninja Multi-Config" 找不到 make program。
 
 on:
   workflow_dispatch:
@@ -29,6 +36,7 @@ jobs:
     env:
       EMSDK: /home/runner/emsdk
       VCPKG_ROOT: /home/runner/vcpkg
+      EM_CACHE: /home/runner/emcache
     steps:
       - name: Checkout (workflow repo)
         uses: actions/checkout@v4
@@ -42,10 +50,16 @@ jobs:
       - name: Show build script (upstream truth)
         run: cat src/script/build-emscripten.bat
 
+      - name: Show vcpkg baseline pin
+        run: |
+          echo "--- vcpkg.json builtin-baseline ---"
+          grep -n '"builtin-baseline"' src/vcpkg.json || echo "(no builtin-baseline)"
+
       - name: Install host tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build cmake pkg-config zip
+          which ninja && ninja --version
 
       - name: Setup Emscripten SDK
         run: |
@@ -55,9 +69,21 @@ jobs:
           source "$EMSDK/emsdk_env.sh"
           emcc --version
 
+      # vcpkg 的 installed/downloads 才是耗时大头（wasm 上要现编 SDL3/freetype/
+      # libpng/harfbuzz...）。vcpkg.json 里既有 builtin-baseline 又逐项钉了版本，
+      # 所以用它做 key 是安全的。
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/runner/vcpkg/installed
+            /home/runner/vcpkg/downloads
+          key: vcpkg-wasm-${{ hashFiles('src/vcpkg.json') }}
+
       - name: Setup vcpkg
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          # 注意：这里**不能**用 --depth 1，见文件头第 2 条。
+          git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
           "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
 
       - name: Configure
@@ -66,7 +92,8 @@ jobs:
           source "$EMSDK/emsdk_env.sh"
           cmake --preset "Emscripten Config" \
             -DUSE_FFMPEG=OFF -DUSE_RENDER_VK=OFF \
-            -DCMAKE_C_COMPILER=emcc -DCMAKE_CXX_COMPILER=em++
+            -DCMAKE_C_COMPILER=emcc -DCMAKE_CXX_COMPILER=em++ \
+            -DCMAKE_MAKE_PROGRAM="$(command -v ninja)"
 
       - name: Build (Release)
         working-directory: src
@@ -83,7 +110,22 @@ jobs:
           cp -v "$OUT"/index.html "$OUT"/index.js "$OUT"/index.wasm "$OUT"/index.data dist/
           ls -la dist
 
+      # 失败时把关键日志打出来（CI 日志本身要 admin token 才能通过 API 取，
+      # 这里直接打到 stdout，方便快速定位）。
+      - name: Diagnostics on failure
+        if: failure()
+        working-directory: src
+        run: |
+          echo "=========== CMakeError.log ==========="
+          find . -name CMakeError.log -exec tail -80 {} \; 2>/dev/null || true
+          echo "=========== vcpkg buildtrees/*/config-*.log (tail) ==========="
+          "$VCPKG_ROOT/vcpkg" list 2>/dev/null || true
+          find "$VCPKG_ROOT/buildtrees" -name 'config-*.log' -exec sh -c 'echo "--- $1"; tail -40 "$1"' _ {} \; 2>/dev/null | tail -200 || true
+          echo "=========== vcpkg install log tail ==========="
+          find "$VCPKG_ROOT/buildtrees" -name 'install-*.log' -exec sh -c 'echo "--- $1"; tail -40 "$1"' _ {} \; 2>/dev/null | tail -200 || true
+
       - name: Publish release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: wasm-build-${{ github.run_number }}
