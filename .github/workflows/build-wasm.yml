@@ -1,0 +1,95 @@
+name: Build krkrsdl3 Emscripten (wasm)
+
+# 目的：把 krkrsdl3 **原样**编译成 WebAssembly，用来判定「画面被居中放大约 1.5 倍」
+# 到底是**引擎问题**还是 **iOS 平台问题**。
+#
+#   wasm 版也裁  ->  引擎问题（与平台无关）-> 可以在 PC 上迭代，不必反复装机
+#   wasm 版正常  ->  iOS 平台问题（SDL3 UIKit 后端）-> 专注 iOS 侧
+#
+# 刻意**不**应用 build-ios.yml 里的任何补丁：那些补丁都关在 _KRKRSDL3_IOS 里面，
+# 这里要的就是上游行为。构建脚本与参数完全照抄上游 script/build-emscripten.bat：
+#   cmake --preset "Emscripten Config" -DUSE_FFMPEG=OFF -DUSE_RENDER_VK=OFF
+#   cmake --build --preset "Emscripten Release Build"
+# 唯一差异：上游 preset 写死了 Windows 的 emcc.bat，在 Linux runner 上用命令行 -D 覆盖成 emcc。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-wasm.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-wasm:
+    name: emscripten release -> index.html/js/wasm/data
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      EMSDK: /home/runner/emsdk
+      VCPKG_ROOT: /home/runner/vcpkg
+    steps:
+      - name: Checkout (workflow repo)
+        uses: actions/checkout@v4
+
+      - name: Fetch krkrsdl3_build source
+        run: |
+          git clone --recursive --shallow-submodules --depth 1 \
+            https://github.com/krkrsdl3/krkrsdl3_build.git src
+          ls src
+
+      - name: Show build script (upstream truth)
+        run: cat src/script/build-emscripten.bat
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake pkg-config zip
+
+      - name: Setup Emscripten SDK
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$EMSDK"
+          "$EMSDK/emsdk" install latest
+          "$EMSDK/emsdk" activate latest
+          source "$EMSDK/emsdk_env.sh"
+          emcc --version
+
+      - name: Setup vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Configure
+        working-directory: src
+        run: |
+          source "$EMSDK/emsdk_env.sh"
+          cmake --preset "Emscripten Config" \
+            -DUSE_FFMPEG=OFF -DUSE_RENDER_VK=OFF \
+            -DCMAKE_C_COMPILER=emcc -DCMAKE_CXX_COMPILER=em++
+
+      - name: Build (Release)
+        working-directory: src
+        run: |
+          source "$EMSDK/emsdk_env.sh"
+          cmake --build --preset "Emscripten Release Build"
+
+      - name: Collect artifacts
+        run: |
+          set -e
+          OUT=src/out/emscripten/Release
+          ls -la "$OUT" || true
+          mkdir -p dist
+          cp -v "$OUT"/index.html "$OUT"/index.js "$OUT"/index.wasm "$OUT"/index.data dist/
+          ls -la dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: wasm-build-${{ github.run_number }}
+          name: wasm-build-${{ github.run_number }}
+          body: |
+            krkrsdl3 Emscripten build (upstream, unpatched).
+            Run: put the game data next to index.html and open
+            index.html?game=data.xp3 via a local http server.
+          files: dist/*
