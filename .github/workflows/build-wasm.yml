@@ -156,22 +156,115 @@ jobs:
       # 再由引擎把 1920x1080 的画布 contain 进窗口（TVPCalcLetterbox）。
       #
       # 对照：不加这段时 spr=1280x720，画面是 1080p 布局的左上 1:1。
-      - name: "Probe: force the engine canvas (LayerWidth/Height) to 1920x1080"
+      # ---- 诊断 + 可选画布覆盖：一次构建，两种跑法 ----
+      #
+      # 目的 1（始终生效，只打日志）：查清「谁把引擎窗口层设成了 1280x720」。
+      #   已经用实测排除的：
+      #     * -hdresomode=720 作为真实 argv（引擎日志 "Specified option : -hdresomode=720"）
+      #       -> 画面逐字节不变
+      #     * -window=1920x1080（引擎日志 "Window size: 1920x1080"）-> KAG 的 layer 仍报 1280x720
+      #     * TJS 侧改 kag.sc / kag.px / primaryLayer.setSize / System.screenWidth
+      #       -> 全部无效
+      #   所以现在直接问引擎：ResetDrawSprite / SetPaintBoxSize / SetSize 各被谁以什么值调用。
+      #
+      # 目的 2（用 ?args=...,-krkrcanvas=WxH 打开）：强制窗口层尺寸。
+      #   实测事实：屏幕上看到的是「1920x1080 布局的左上 1280x720，1:1」
+      #   （对 MuMu 正常画面做缩放扫描：diff=6.0 zoom=1.50 window=1279x719 @(0,0)；
+      #     菜单项位置也逐项吻合 2/3 比例）。若把画布给到 1920x1080 后画面完整，
+      #   根因就是「游戏按 1080p 布局、画布只有 720p」；若画面不变，裁剪在游戏内部。
+      - name: "Probe: log window-layer size + optional -krkrcanvas=WxH override"
         run: |
           python3 - <<'PY'
           import io
-          p = 'src/cpp/core/main/TVPWindow.cpp'
+
+          # ---- 1) TVPSettings.cpp：解析 -krkrcanvas=WxH，定义两个全局量 ----
+          p = 'src/cpp/core/utils/TVPSettings.cpp'
           s = io.open(p, encoding='utf-8').read()
-          marker = 'void TVPWindow::ResetDrawSprite()\n{\n'
-          assert marker in s, 'ResetDrawSprite not found'
-          s = s.replace(
-              marker,
-              marker + '    LayerWidth = 1920; LayerHeight = 1080;  /* r39 probe */\n',
-              1)
+          m = 'static void TVPInitProgramArguments(int tvp_argc, char* tvp_argv[])'
+          assert m in s, 'TVPInitProgramArguments not found'
+          s = s.replace(m, 'int krkrForceCanvasW = 0;\nint krkrForceCanvasH = 0;\n\n' + m, 1)
+          hook = '    TVPInitProgramArguments(argc, argv);\n    TVPDumpOptions();\n'
+          assert hook in s, 'arg hook not found'
+          s = s.replace(hook, hook + '''
+    // --- probe: -krkrcanvas=WxH 覆盖引擎窗口层尺寸（默认 0 = 关闭） ---
+    {
+        tTJSVariant krkrOpt;
+        if (TVPGetCommandLine(TJS_N("-krkrcanvas"), &krkrOpt))
+        {
+            ttstr krkrStr(krkrOpt);
+            const tjs_char* krkrP = krkrStr.c_str();
+            int krkrW = 0, krkrH = 0;
+            while (*krkrP >= '0' && *krkrP <= '9') { krkrW = krkrW * 10 + (*krkrP - '0'); krkrP++; }
+            if (*krkrP == 'x' || *krkrP == 'X')
+            {
+                krkrP++;
+                while (*krkrP >= '0' && *krkrP <= '9') { krkrH = krkrH * 10 + (*krkrP - '0'); krkrP++; }
+            }
+            if (krkrW > 0 && krkrH > 0)
+            {
+                krkrForceCanvasW = krkrW;
+                krkrForceCanvasH = krkrH;
+            }
+        }
+        TVPAddImportantLog(ttstr("[probe] krkrcanvas -> ") + ttstr(krkrForceCanvasW)
+            + TJS_N("x") + ttstr(krkrForceCanvasH));
+    }
+''', 1)
           io.open(p, 'w', encoding='utf-8').write(s)
-          print('patched TVPWindow::ResetDrawSprite')
+          print('patched', p)
+
+          # ---- 2) TVPWindow.cpp：打日志 + 按需覆盖 ----
+          p2 = 'src/cpp/core/main/TVPWindow.cpp'
+          t = io.open(p2, encoding='utf-8').read()
+          m2 = 'void TVPWindow::ResetDrawSprite()\n{\n'
+          assert m2 in t, 'ResetDrawSprite not found'
+          t = t.replace(m2, m2 + '''    {
+        extern int krkrForceCanvasW;
+        extern int krkrForceCanvasH;
+        if (krkrForceCanvasW > 0)
+        {
+            LayerWidth = krkrForceCanvasW;
+            LayerHeight = krkrForceCanvasH;
+        }
+        static int krkrN1 = 0;
+        if (krkrN1 < 10)
+        {
+            krkrN1++;
+            TVPAddImportantLog(ttstr("[probe] ResetDrawSprite layer=") + ttstr((int)LayerWidth)
+                + TJS_N("x") + ttstr((int)LayerHeight) + TJS_N(" sprite=")
+                + ttstr((int)pSprite->width) + TJS_N("x") + ttstr((int)pSprite->height));
+        }
+    }
+''', 1)
+          m3 = 'void TVPWindow::SetPaintBoxSize(tjs_int w, tjs_int h)\n{\n'
+          assert m3 in t, 'SetPaintBoxSize not found'
+          t = t.replace(m3, m3 + '''    {
+        static int krkrN2 = 0;
+        if (krkrN2 < 10)
+        {
+            krkrN2++;
+            TVPAddImportantLog(ttstr("[probe] SetPaintBoxSize ") + ttstr((int)w) + TJS_N("x") + ttstr((int)h));
+        }
+    }
+''', 1)
+          m4 = 'void TVPWindow::SetSize(tjs_int w, tjs_int h)\n{\n'
+          assert m4 in t, 'SetSize not found'
+          t = t.replace(m4, m4 + '''    {
+        static int krkrN3 = 0;
+        if (krkrN3 < 10)
+        {
+            krkrN3++;
+            TVPAddImportantLog(ttstr("[probe] SetSize ") + ttstr((int)w) + TJS_N("x") + ttstr((int)h));
+        }
+    }
+''', 1)
+          io.open(p2, 'w', encoding='utf-8').write(t)
+          print('patched', p2)
           PY
-          grep -n -A 5 'void TVPWindow::ResetDrawSprite' src/cpp/core/main/TVPWindow.cpp
+          echo '--- TVPWindow.cpp ---'
+          grep -n 'probe' src/cpp/core/main/TVPWindow.cpp | head
+          echo '--- TVPSettings.cpp ---'
+          grep -n 'krkrForceCanvas\|probe' src/cpp/core/utils/TVPSettings.cpp | head
 
       - name: Configure
         working-directory: src
