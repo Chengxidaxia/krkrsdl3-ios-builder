@@ -847,7 +847,7 @@ jobs:
           # 480x320，游戏会按 3:2 而非 16:9 排版（r28 日志 `SIZE screen=1280x720`
           # 那一行是旧补丁硬编码 1280/720 的结果，本轮改为真实值以保持一致）。
           p3 = "src/cpp/environ/sdl3/sdl3_utils.cpp"
-          MARK3 = "patched: native design resolution"
+          MARK3 = "patched: design resolution"
           GW = ("int tTVPScreen::GetWidth()\n"
                 "{\n"
                 "    SDL_DisplayID display = SDL_GetPrimaryDisplay();\n"
@@ -856,18 +856,34 @@ jobs:
                 "}")
           GWn = ("int tTVPScreen::GetWidth()\n"
                  "{\n"
-                 "    /* patched: native design resolution (1280x720, 16:9); the engine letterboxes\n"
-                 "       The engine letterboxes the 1280x720 primary layer into the real\n"
-                 "       window (812x375); reporting the wider window size made the game\n"
-                 "       cover-fit and crop the top/bottom of its 16:9 content. Input is\n"
-                 "       unaffected: KRKR_Trig_MouseDown maps window pixels back to the\n"
-                 "       1280x720 sprite via (x - xPos) / scale.\n"
-                 "       r30: deliberately back to the design resolution.  r29 reported the\n"
-                 "       UIKit physical size (1624x750) here; the game's own primary layer\n"
-                 "       stayed 1280x720 either way (see SIZE layer in the log), so the change\n"
-                 "       bought nothing and only added a second, disagreeing notion of the\n"
-                 "       screen. Keep one number: the game canvas. */\n"
-                 "    return 1280;\n"
+                 "    /* patched: design resolution (1920x1080) -- NOT the canvas.\n"
+                 "\n"
+                 "       r32 root cause. KAG adapts to a screen that differs from its drawing\n"
+                 "       surface (\"sq mode\"): when kag.scWidth/scHeight == kag.pxWidth/pxHeight\n"
+                 "       it concludes no scaling is needed and paints straight into the canvas\n"
+                 "       using the design coordinates. This game is a 1920x1080 title; the\n"
+                 "       engine canvas on iOS is 1280x720. So reporting 1280x720 here made the\n"
+                 "       two agree and the game painted 1920x1080 worth of layout into a\n"
+                 "       1280x720 surface -- the CENTRE 66.7% was all that survived, magnified\n"
+                 "       exactly 1.50x (= 1920/1280 = 1080/720).  Measured against the PC\n"
+                 "       release with a centre-crop sweep: diff dropped from 60.9 to 11.2 at\n"
+                 "       zoom 1.50. That one number produced every symptom the user reported:\n"
+                 "       the logo (top-left of the 1080p art) fell outside the crop, the top,\n"
+                 "       bottom and right of the artwork were cut, and the UI looked misaligned\n"
+                 "       because it is positioned for 1920x1080 and then magnified.\n"
+                 "\n"
+                 "       Reporting the design resolution instead makes sc != px, KAG applies\n"
+                 "       its contain scale (1280/1920 = 0.667) and the WHOLE picture lands on\n"
+                 "       the canvas. The visible size does not change: the engine still\n"
+                 "       letterboxes the 1280x720 canvas into 812x375 -> 667x375 (see\n"
+                 "       TVPCalcLetterbox), so the picture stays the same size on screen, just\n"
+                 "       complete instead of cropped. Input is unaffected either way:\n"
+                 "       KRKR_Trig_MouseDown maps window pixels back through (x - xPos) / scale.\n"
+                 "\n"
+                 "       Do NOT put the physical screen size here (r29 tried 1624x750): it is\n"
+                 "       neither the design resolution nor the canvas, and it only made the\n"
+                 "       scaling unpredictable. */\n"
+                 "    return 1920;\n"
                  "}")
           s3, crlf3 = load(p3)
           if MARK3 in s3:
@@ -887,8 +903,9 @@ jobs:
                     "}")
               GHn = ("int tTVPScreen::GetHeight()\n"
                      "{\n"
-                     "    /* patched: native design resolution (height, see GetWidth). */\n"
-                     "    return 720;\n"
+                     "    /* patched: design resolution (height, see GetWidth).\n"
+                     "       r32: 1080, not 720 -- see the note in GetWidth. */\n"
+                     "    return 1080;\n"
                      "}")
               s3 = sub1(s3, GH, GHn, "get-height")
               save(p3, s3, crlf3)
@@ -1005,8 +1022,8 @@ jobs:
           grep -c "storage miss: " src/cpp/core/archive/TVPStorage.cpp || true
           echo "--- verify: miss logging removal marker ---"
           grep -n "miss logging removed" src/cpp/core/archive/TVPStorage.cpp || true
-          echo "--- verify: screen size reports native design resolution (1280x720) ---"
-          grep -n "patched: native design resolution" src/cpp/environ/sdl3/sdl3_utils.cpp || true
+          echo "--- verify: screen size reports the game DESIGN resolution (1920x1080) ---"
+          grep -n "patched: design resolution" src/cpp/environ/sdl3/sdl3_utils.cpp || true
           echo "--- verify: tvp_window exported ---"
           grep -n "^SDL_Window\* tvp_window;" src/cpp/environ/sdl3/sdl3_app.cpp || true
           echo "--- verify: forced letterbox in place ---"
