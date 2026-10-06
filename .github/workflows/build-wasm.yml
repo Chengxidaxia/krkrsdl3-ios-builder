@@ -142,6 +142,37 @@ jobs:
           grep -n -A 8 'int tTVPScreen::GetDesktopWidth' "$F"
           grep -n -A 8 'int tTVPScreen::GetDesktopHeight' "$F"
 
+      # ---- r39 对照实验：把「引擎画布」强行钉成 1920x1080 ----
+      #
+      # 已经把尺寸类参数全排除了（screenWidth / desktopWidth / kag.sc /
+      # kag.px / primaryLayer.setSize / hdresomode -- 见 patch.tjs 里的记录）。
+      # 改 KAG 的 layer 尺寸完全没用，因为 KAG 的 Layer 不是引擎的 TVPWindow：
+      # 真正决定画布(=日志里的 spr)的是 TVPWindow 的 LayerWidth/LayerHeight，
+      # 而它在 ResetDrawSprite() 里落到 pSprite 上并重建贴图。
+      #
+      # 这个构建把 LayerWidth/LayerHeight 强制成 1920x1080：
+      # 素材本身就是 1080p 的（title.pimg 等界面布局只存在于 data1080.xp3），
+      # 如果游戏确实是照 1080p 布局画的，那么画布给到 1080p 就应该完整，
+      # 再由引擎把 1920x1080 的画布 contain 进窗口（TVPCalcLetterbox）。
+      #
+      # 对照：不加这段时 spr=1280x720，画面是 1080p 布局的左上 1:1。
+      - name: "Probe: force the engine canvas (LayerWidth/Height) to 1920x1080"
+        run: |
+          python3 - <<'PY'
+          import io
+          p = 'src/cpp/core/main/TVPWindow.cpp'
+          s = io.open(p, encoding='utf-8').read()
+          marker = 'void TVPWindow::ResetDrawSprite()\n{\n'
+          assert marker in s, 'ResetDrawSprite not found'
+          s = s.replace(
+              marker,
+              marker + '    LayerWidth = 1920; LayerHeight = 1080;  /* r39 probe */\n',
+              1)
+          io.open(p, 'w', encoding='utf-8').write(s)
+          print('patched TVPWindow::ResetDrawSprite')
+          PY
+          grep -n -A 5 'void TVPWindow::ResetDrawSprite' src/cpp/core/main/TVPWindow.cpp
+
       - name: Configure
         working-directory: src
         run: |
